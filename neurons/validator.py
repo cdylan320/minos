@@ -56,6 +56,45 @@ BITTENSOR_BLOCK_TIME_SECONDS = 12
 MAX_SLEEP_SECONDS = 120
 
 
+def auto_scoring_config():
+    """Size concurrent scoring jobs from host CPU/RAM.
+
+    Reserves 4 cores + 16 GB for OS/Docker/hap.py overhead, then picks per-job
+    threads (clamped 2-8) and concurrency = min(cpu-bound, ram-bound, 8).
+    Memory per job is pinned at 16 GB (DeepVariant minimum).
+
+    Env overrides: MINOS_VALIDATOR_CONCURRENCY, SCORING_THREADS, SCORING_MEMORY_GB.
+    """
+    cores = os.cpu_count() or 2
+    try:
+        ram_gb = (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) // (1024**3)
+    except (ValueError, AttributeError, OSError):
+        ram_gb = 16
+
+    usable_cores = max(2, cores - 4)
+    usable_ram = max(16, ram_gb - 16)
+
+    auto_threads = min(8, max(2, usable_cores // 4))
+    auto_mem_gb = 16
+
+    threads_per_job = int(os.getenv("SCORING_THREADS") or auto_threads)
+    mem_per_job_gb = int(os.getenv("SCORING_MEMORY_GB") or auto_mem_gb)
+
+    n_by_cpu = max(1, usable_cores // threads_per_job)
+    n_by_mem = max(1, usable_ram // mem_per_job_gb)
+    auto_n = min(n_by_cpu, n_by_mem, 8)
+
+    concurrency = max(1, int(os.getenv("MINOS_VALIDATOR_CONCURRENCY") or auto_n))
+
+    return {
+        "concurrency": concurrency,
+        "threads_per_job": threads_per_job,
+        "mem_per_job_gb": mem_per_job_gb,
+        "host_cores": cores,
+        "host_ram_gb": int(ram_gb),
+    }
+
+
 class Validator:
     """Minos validator for genomics variant calling tasks."""
 
@@ -109,6 +148,21 @@ class Validator:
         self.setup_platform_client()
 
         self.use_platform = self.platform_client is not None
+
+        self._scoring_cfg = auto_scoring_config()
+        bt.logging.info(
+            f"Scoring auto-tune: {self._scoring_cfg['concurrency']} concurrent × "
+            f"{self._scoring_cfg['threads_per_job']} threads × "
+            f"{self._scoring_cfg['mem_per_job_gb']} GB "
+            f"(host: {self._scoring_cfg['host_cores']}c / {self._scoring_cfg['host_ram_gb']} GB RAM)"
+        )
+        # Older .env files pinned SCORING_MEMORY_GB=8, which OOMs DeepVariant.
+        if self._scoring_cfg["mem_per_job_gb"] < 16:
+            bt.logging.warning(
+                f"SCORING_MEMORY_GB={self._scoring_cfg['mem_per_job_gb']} is below "
+                f"DeepVariant's 16 GB minimum; DV jobs will OOM. "
+                f"Unset to enable auto-tuning."
+            )
 
         bt.logging.info(f"Validator initialization complete")
         bt.logging.info(f"Network: {self.config.subtensor.network}, Netuid: {self.config.netuid}")
@@ -425,24 +479,56 @@ class Validator:
                 # No assignment (fallback mode) — score all in original order
                 ordered_subs = submissions
 
-            for sub in ordered_subs:
-                miner_hotkey = sub.get("miner_hotkey", "")
-                is_secondary = bool(primary_hotkeys) and miner_hotkey not in primary_hotkeys
+            # Score primaries first as a barrier, then secondaries (which may be
+            # skipped near the deadline). In-flight jobs always finish; the
+            # deadline check only prevents starting new secondary work.
+            sem = asyncio.Semaphore(self._scoring_cfg["concurrency"])
 
-                # Stop secondary scoring when approaching deadline
-                if is_secondary and should_stop_secondary_scoring(scoring_deadline, buffer_seconds=180):
-                    bt.logging.info(
-                        f"Round {round_id}: approaching deadline — "
-                        f"stopping secondary scoring, {len(secondary_subs)} secondary miners remaining"
+            async def _bounded_score(sub, is_secondary: bool):
+                async with sem:
+                    if is_secondary and should_stop_secondary_scoring(scoring_deadline, buffer_seconds=180):
+                        bt.logging.debug(
+                            f"Round {round_id}: deadline reached, skipping secondary "
+                            f"miner {sub.get('miner_hotkey', '')[:16]}..."
+                        )
+                        return
+                    await self._score_single_miner(
+                        round_id, sub, already_scored, work_dir, bam_path,
+                        ref_path, ref_sdf_path, truth_bed_path, truth_vcf_path,
+                        region, scored_hotkeys, submission_times,
+                        mutations_vcf_path=mutations_vcf_path,
                     )
-                    break
 
-                await self._score_single_miner(
-                    round_id, sub, already_scored, work_dir, bam_path,
-                    ref_path, ref_sdf_path, truth_bed_path, truth_vcf_path,
-                    region, scored_hotkeys, submission_times,
-                    mutations_vcf_path=mutations_vcf_path,
+            if primary_hotkeys:
+                primary_subs_only = [s for s in ordered_subs if s.get("miner_hotkey") in primary_hotkeys]
+                secondary_subs_only = [s for s in ordered_subs if s.get("miner_hotkey") not in primary_hotkeys]
+
+                if primary_subs_only:
+                    bt.logging.info(
+                        f"Round {round_id}: scoring {len(primary_subs_only)} primary miners "
+                        f"(concurrency={self._scoring_cfg['concurrency']})"
+                    )
+                    await asyncio.gather(*[_bounded_score(s, False) for s in primary_subs_only])
+
+                if secondary_subs_only:
+                    if should_stop_secondary_scoring(scoring_deadline, buffer_seconds=180):
+                        bt.logging.info(
+                            f"Round {round_id}: approaching deadline — skipping "
+                            f"{len(secondary_subs_only)} secondary miners"
+                        )
+                    else:
+                        bt.logging.info(
+                            f"Round {round_id}: scoring {len(secondary_subs_only)} secondary miners "
+                            f"(concurrency={self._scoring_cfg['concurrency']})"
+                        )
+                        await asyncio.gather(*[_bounded_score(s, True) for s in secondary_subs_only])
+            else:
+                # No assignment (fallback / single-validator) — score everyone concurrently
+                bt.logging.info(
+                    f"Round {round_id}: scoring {len(ordered_subs)} miners (no assignment, "
+                    f"concurrency={self._scoring_cfg['concurrency']})"
                 )
+                await asyncio.gather(*[_bounded_score(s, False) for s in ordered_subs])
 
             # --- Steps 5 & 6: Backfill + finalize ---
             await self._finalize_round_scores(
@@ -692,7 +778,9 @@ class Validator:
             happy_vcf_path = work_dir / f"happy_{original_query_stem}.vcf.gz"
 
             try:
-                vcf_s3_prefix = f"scoring/{safe_round_dir_name(round_id)}"
+                # Platform requires uploads to be namespaced under the validator's
+                # hotkey so each validator can only write to its own audit prefix.
+                vcf_s3_prefix = f"scoring/{self.wallet.hotkey.ss58_address}/{safe_round_dir_name(round_id)}"
 
                 # Upload miner output VCF
                 if miner_vcf_path.exists():
@@ -729,7 +817,11 @@ class Validator:
                 happy_output_s3_key=happy_output_s3_key,
             )
 
-            # 8. Parse and submit variant-level results (non-blocking)
+            # 8. Parse and submit variant-level results (non-blocking).
+            # The validator gzips the per-variant breakdown locally, uploads
+            # it via /v2/get-upload-url (R2 -> Hippius -> AWS cascade decided
+            # server-side), then POSTs only a small pointer. Failure here
+            # never blocks scoring — it's audit data, not consensus data.
             try:
                 if happy_vcf_path.exists() and score_result:
                     score_id = score_result.get("score_id")
@@ -738,9 +830,10 @@ class Validator:
                         if variant_results:
                             await self.platform_client.submit_variant_results(
                                 score_id=score_id,
-                                results=variant_results
+                                round_id=round_id,
+                                results=variant_results,
                             )
-                            print(f"   Submitted {len(variant_results)} variant-level results", flush=True)
+                            print(f"   Uploaded {len(variant_results)} variant-level results", flush=True)
             except Exception as e:
                 bt.logging.warning(f"Variant results submission failed for {miner_hotkey[:16]}: {e}")
 
@@ -890,17 +983,13 @@ class Validator:
             sanitized_config = {k: v for k, v in tool_config.items()
                                 if k in ALLOWED_CONFIG_KEYS}
 
-            # Scoring resource profile — configurable via env vars.
-            # Validators can tune these to match their hardware.
-            # Thread/memory counts affect speed, not variant-calling output.
-            SCORING_THREADS = int(os.getenv("SCORING_THREADS", "4"))
-            SCORING_MEMORY_GB = int(os.getenv("SCORING_MEMORY_GB", "8"))
-
+            # Per-job thread/memory come from auto_scoring_config (set in __init__);
+            # SCORING_THREADS / SCORING_MEMORY_GB env vars override there.
             config = {
                 **sanitized_config,  # Miner's quality params FIRST
                 "timeout": GENOMICS_CONFIG.get("variant_calling_timeout", 1800),
-                "threads": SCORING_THREADS,
-                "memory_gb": SCORING_MEMORY_GB,
+                "threads": self._scoring_cfg["threads_per_job"],
+                "memory_gb": self._scoring_cfg["mem_per_job_gb"],
                 "ref_build": "GRCh38",  # Standard reference build
             }
 
@@ -1000,38 +1089,22 @@ class Validator:
             return None
 
     async def _set_weights_after_round(self, round_id: str, submission_times: dict = None):
-        """Compute weight distribution, set on chain, and POST history to platform.
+        """Compute weight distribution, set on chain (if registered), and POST history to platform.
 
-        Called after all miners in a round have been scored and EMA updated.
-
-        Args:
-            round_id: The round that was just scored.
-            submission_times: Dict of {hotkey: epoch} for tiebreaking.
+        Platform submission happens regardless of chain registration so the
+        public dashboard reflects what each validator would have set even when
+        running unregistered (preprod, demo). Chain set_weights still requires
+        registration.
         """
-        if not self.is_registered:
-            bt.logging.info("Skipping weight setting — not registered (demo mode)")
-            return
-
         try:
-            # Build list of miner hotkeys from metagraph (exclude validators and self)
-            miner_hotkeys = []
-            hotkey_to_uid = {}
-            for uid in range(len(self.metagraph.hotkeys)):
-                if uid == self.my_subnet_uid:
-                    continue
-                if self.metagraph.validator_permit[uid]:
-                    continue
-                hk = self.metagraph.hotkeys[uid]
-                miner_hotkeys.append(hk)
-                hotkey_to_uid[hk] = uid
-
-            if not miner_hotkeys:
-                bt.logging.warning("No miners found for weight setting")
+            # Compute weights over the miners we've actually scored.
+            tracked_miners = list(self.score_tracker.ema_scores.keys())
+            if not tracked_miners:
+                bt.logging.info("No miners scored — skipping weight assignment")
                 return
 
-            # Compute weight distribution
             weights = self.score_tracker.get_winner_takes_all_weights(
-                miner_hotkeys, submission_times
+                tracked_miners, submission_times
             )
 
             # Log weight distribution (mode-aware)
@@ -1040,26 +1113,21 @@ class Validator:
             is_warmup = stats['eligible_count'] == 0
             mode_label = "warmup split" if is_warmup else "winner-takes-all"
             print(f"\n   Weight distribution ({mode_label}):", flush=True)
-            print(f"   Eligible: {stats['eligible_count']}/{len(miner_hotkeys)} miners "
+            print(f"   Eligible: {stats['eligible_count']}/{len(tracked_miners)} miners "
                   f"(need {stats['min_rounds_required']} rounds)", flush=True)
             if recipients:
                 for r_hk in recipients:
                     r_w = weights[r_hk]
                     r_ema = self.score_tracker.ema_scores.get(r_hk, 0)
-                    r_uid = hotkey_to_uid.get(r_hk, "?")
-                    print(f"   UID {r_uid} ({r_hk[:16]}...) EMA={r_ema:.4f} weight={r_w:.2f}", flush=True)
+                    print(f"   {r_hk[:16]}... EMA={r_ema:.4f} weight={r_w:.2f}", flush=True)
             else:
                 print(f"   No recipients — weights submission skipped (fail-closed)", flush=True)
 
-            # Set weights on chain (blocking RPC — run in thread to avoid blocking event loop)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.set_weights, weights, hotkey_to_uid)
-
-            # POST weight history to platform (non-blocking)
+            # POST weight history to platform (always — telemetry for the dashboard)
             try:
                 validator_hotkey = self.wallet.hotkey.ss58_address
                 entries = self.score_tracker.build_weight_history(
-                    round_id, validator_hotkey, miner_hotkeys, weights
+                    round_id, validator_hotkey, tracked_miners, weights
                 )
                 await self.platform_client.submit_weight_history(
                     round_id=round_id,
@@ -1069,6 +1137,29 @@ class Validator:
                 bt.logging.info(f"Weight history submitted to platform for round {round_id}")
             except Exception as e:
                 bt.logging.warning(f"Failed to POST weight history: {e}")
+
+            # Set weights on chain — only if this validator is registered. Skip in
+            # preprod/demo mode but still keep the platform submission above.
+            if not self.is_registered:
+                bt.logging.info("Skipping on-chain set_weights — not registered (demo mode)")
+                return
+
+            # Map tracked miners to metagraph UIDs; drop any not on chain right now.
+            hotkey_to_uid = {}
+            for uid in range(len(self.metagraph.hotkeys)):
+                if uid == self.my_subnet_uid:
+                    continue
+                if self.metagraph.validator_permit[uid]:
+                    continue
+                hotkey_to_uid[self.metagraph.hotkeys[uid]] = uid
+
+            chain_weights = {hk: w for hk, w in weights.items() if hk in hotkey_to_uid}
+            if not chain_weights:
+                bt.logging.warning("No tracked miners on chain — skipping chain set_weights")
+                return
+
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.set_weights, chain_weights, hotkey_to_uid)
 
         except Exception as e:
             bt.logging.error(f"Error in _set_weights_after_round: {e}")

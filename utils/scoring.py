@@ -519,11 +519,18 @@ class HappyScorer:
             use_bed = False
             subset_bed_path = None
 
+            # Per-miner suffix for intermediate filenames. score_vcf is called
+            # concurrently for multiple miners sharing the same output_dir;
+            # without unique names, two miners would race on the same truth /
+            # bed files and produce intermittent zero or wrong scores.
+            region_slug = region.replace(':', '_').replace('-', '_') if region else "noregion"
+            unique_suffix = original_query_stem
+
             if bed_path and bed_path.exists():
                 # Subset BED file to only include regions overlapping with task region
                 # This improves performance and accuracy
                 if region:
-                    subset_bed_path = output_dir / f"confident_{region.replace(':', '_').replace('-', '_')}.bed"
+                    subset_bed_path = output_dir / f"confident_{region_slug}_{unique_suffix}.bed"
                     logger.info(f"Creating subset BED for region {region}...")
                     if subset_bed(bed_path, subset_bed_path, region):
                         bed_path = subset_bed_path
@@ -543,7 +550,7 @@ class HappyScorer:
             # Slice truth VCF to region for performance
             sliced_truth_vcf = None
             if region and truth_vcf.exists():
-                sliced_truth_vcf = output_dir / f"truth_{region.replace(':', '_').replace('-', '_')}.vcf.gz"
+                sliced_truth_vcf = output_dir / f"truth_{region_slug}_{unique_suffix}.vcf.gz"
                 logger.info(f"Creating sliced truth VCF for region {region}...")
                 if slice_truth_vcf(truth_vcf, sliced_truth_vcf, region):
                     truth_vcf = sliced_truth_vcf
@@ -553,7 +560,7 @@ class HappyScorer:
 
             # Restrict scoring to synthetic mutation regions only
             # This focuses hap.py on injected mutations, ignoring GIAB "free answers"
-            synthetic_bed = output_dir / "synthetic_regions.bed"
+            synthetic_bed = output_dir / f"synthetic_regions_{unique_suffix}.bed"
             if generate_synthetic_regions_bed(str(truth_vcf), str(synthetic_bed)):
                 bed_path = synthetic_bed
                 use_bed = True
@@ -600,8 +607,9 @@ class HappyScorer:
             if not query_in_output_dir:
                 cmd_parts.extend(["-v", f"{query_vcf.parent}:/data/query"])
 
-            # Add SDF mount for vcfeval engine
-            cmd_parts.extend(["-v", f"{sdf_path}:/data/sdf"])
+            # Add SDF mount for vcfeval engine. Read-only: RTG vcfeval treats
+            # the template as read-only and concurrent miners share this mount.
+            cmd_parts.extend(["-v", f"{sdf_path}:/data/sdf:ro"])
 
             # Add BED mount only if using BED and it's in a different directory than truth VCF
             if use_bed and bed_path.parent != truth_vcf.parent:

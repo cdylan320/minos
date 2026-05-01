@@ -139,7 +139,7 @@ def variant_call(
         elapsed = time.time() - start_time
 
         if result.returncode != 0:
-            error = result.stderr[:500] if result.stderr else "BCFtools failed"
+            error = result.stderr[-500:] if result.stderr else "BCFtools failed"
             if "Cannot connect to the Docker daemon" in str(result.stderr):
                 error = "Docker not running"
             elif "Unable to find image" in str(result.stderr):

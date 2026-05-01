@@ -70,18 +70,23 @@ def variant_call(
             direct_flags.append(f)
 
     start_time = time.time()
-    intermediate_dir = output_vcf_path.parent / "dv_intermediate"
+    output_name = output_vcf_path.stem.replace(".vcf", "")
+    # Per-output intermediate dir. Validators run multiple DeepVariant miners
+    # concurrently from the same parent dir; a fixed "dv_intermediate" name
+    # would collide and the finally-block rmtree would delete a peer's data.
+    intermediate_subdir = f"dv_intermediate_{output_name}"
+    intermediate_dir = output_vcf_path.parent / intermediate_subdir
     intermediate_dir.mkdir(parents=True, exist_ok=True)
 
-    output_name = output_vcf_path.stem.replace(".vcf", "")
     final_vcf = output_vcf_path.parent / f"{output_name}.vcf.gz"
 
-    # Auto-detect available memory
+    # Auto-detect available memory. Fallback floor is DeepVariant's 16 GB
+    # minimum to avoid silent OOM if sysconf is unavailable.
     try:
         total_mem_bytes = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
         auto_mem_gb = max(1, int(total_mem_bytes / (1024**3)) - 1)
     except (ValueError, OSError, AttributeError):
-        auto_mem_gb = 4
+        auto_mem_gb = 16
     memory_gb = config.get("memory_gb", auto_mem_gb)
 
     cmd = [
@@ -97,7 +102,7 @@ def variant_call(
         f"--reads=/input/{bam_path.name}",
         f"--output_vcf=/output/{final_vcf.name}",
         f"--output_gvcf=/output/{output_name}.g.vcf.gz",
-        "--intermediate_results_dir=/output/dv_intermediate",
+        f"--intermediate_results_dir=/output/{intermediate_subdir}",
         f"--num_shards={threads}",
         f"--regions={region}",
     ]
@@ -120,7 +125,16 @@ def variant_call(
         elapsed = time.time() - start_time
 
         if result.returncode != 0:
-            error = result.stderr[:500] if result.stderr else "DeepVariant failed"
+            # Strip TF INFO log lines (they dominate DV stderr) and keep the
+            # tail of what's left, where the actual error lives.
+            raw = result.stderr or ""
+            kept = "\n".join(
+                line for line in raw.splitlines()
+                if not line.startswith("I0")
+                and "I tensorflow" not in line
+                and not line.lstrip().startswith("To enable")
+            )
+            error = (kept or raw)[-500:] or "DeepVariant failed"
             if "Cannot connect to the Docker daemon" in str(result.stderr):
                 error = "Docker not running"
             elif "Unable to find image" in str(result.stderr):

@@ -88,8 +88,10 @@ VALIDATOR_REFERENCE_DIRS = [
     f"datasets/reference/{chrom}/{chrom}.sdf" for chrom in SUPPORTED_CHROMOSOMES
 ]
 
-# S3 health check URL
-S3_HEALTH_URL = "https://genotypenet-platform.s3.us-east-1.amazonaws.com/reference_data/donors/reference/chr20/chr20.fa.fai"
+# Reference data health check URL — uses platform redirect endpoint so we
+# stay in sync with whatever storage backend the platform points to (R2 today).
+# Must match REF_S3_BASE in setup.py.
+REF_HEALTH_URL = "https://api.theminos.ai/reference/chr20/chr20.fa.fai"
 
 # Key Python packages to check
 REQUIRED_PACKAGES = {
@@ -322,14 +324,20 @@ def check_platform_api() -> Check:
 
 
 def check_s3_access() -> Check:
+    """Verify reference data download works via the platform redirect endpoint.
+
+    Uses GET (the redirect endpoint doesn't accept HEAD). chr20.fa.fai is ~23
+    bytes so the request completes near-instantly. urllib follows the 302
+    redirect to the underlying storage (R2 today) automatically.
+    """
     try:
-        req = urllib.request.Request(S3_HEALTH_URL, method="HEAD")
+        req = urllib.request.Request(REF_HEALTH_URL, method="GET")
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status == 200:
-                return Check("S3 access", Status.PASS, "reachable", "network")
-            return Check("S3 access", Status.WARN, f"HTTP {resp.status}", "network")
+                return Check("Reference data access", Status.PASS, "reachable", "network")
+            return Check("Reference data access", Status.WARN, f"HTTP {resp.status}", "network")
     except Exception as e:
-        return Check("S3 access", Status.FAIL, _short_error(e), "network")
+        return Check("Reference data access", Status.FAIL, _short_error(e), "network")
 
 
 def check_wallet() -> Check:

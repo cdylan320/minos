@@ -23,7 +23,7 @@ show_help() {
     echo "  --wallet-name <name>        Wallet name"
     echo "  --wallet-hotkey <name>      Hotkey name"
     echo "  --miner-template <tool>     Variant caller: gatk, deepvariant, freebayes, bcftools"
-    echo "  --storage <backend>         Storage backend: hippius, aws_s3"
+    echo "  --storage <backend>         Fetch order: hippius (default) or aws_s3 (R2/AWS first)"
     echo "  --setup                     Re-run interactive setup wizard"
     echo "  --help                      Show this help message"
     echo ""

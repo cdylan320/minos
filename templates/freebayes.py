@@ -102,7 +102,7 @@ def variant_call(
             )
 
         if result.returncode != 0:
-            error = result.stderr[:500] if result.stderr else "FreeBayes failed"
+            error = result.stderr[-500:] if result.stderr else "FreeBayes failed"
             if "Cannot connect to the Docker daemon" in str(result.stderr):
                 error = "Docker not running"
             elif "Unable to find image" in str(result.stderr):

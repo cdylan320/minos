@@ -1,0 +1,108 @@
+name: Tests & Status
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('requirements.txt', 'requirements-dev.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest tests/ --cov=utils --cov=templates --cov-report=term-missing -q
+
+  status:
+    name: Status Check
+    runs-on: ubuntu-latest
+    # Hard cap: status.py can hang on Bittensor chain RPC from CI runners.
+    # 5 min is plenty for setup + a 90s probe.
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-3.10-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-3.10-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run status check (JSON)
+        # Wrap in `timeout` so a hung subtensor / chain RPC can't burn the whole
+        # job. 90s is plenty for module imports + platform-API probe; chain
+        # checks that need longer are not meaningful in CI anyway.
+        run: timeout 90 python neurons/status.py --json --role miner > status.json || true
+        # Exit code 1 (or 124 from timeout) is expected in CI (no Docker/refs/chain) —
+        # we check critical fields below
+
+      - name: Verify module imports pass
+        run: |
+          python -c "
+          import json, sys
+          report = json.load(open('status.json'))
+          checks = {c['name']: c for c in report['checks']}
+
+          # These must pass — code-level checks that catch regressions
+          critical = ['Python version', 'Module imports', 'Python deps']
+          failed = []
+          for name in critical:
+              if name in checks and checks[name]['status'] == 'fail':
+                  failed.append(f\"{name}: {checks[name]['detail']}\")
+
+          if failed:
+              print('CRITICAL CHECKS FAILED:')
+              for f in failed:
+                  print(f'  ✗ {f}')
+              sys.exit(1)
+          else:
+              print('All critical checks passed')
+              for name in critical:
+                  if name in checks:
+                      print(f'  ✓ {name}: {checks[name][\"detail\"]}')
+          "
+
+      - name: Upload status report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: status-report
+          path: status.json

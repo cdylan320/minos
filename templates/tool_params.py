@@ -121,7 +121,15 @@ def validate_round_id(round_id: str) -> Dict[str, Any]:
     try:
         dt = datetime.fromisoformat(round_id)
     except (ValueError, TypeError):
-        return {"valid": False, "error": f"round_id is not a valid ISO-8601 timestamp: '{round_id}'"}
+        # Legacy round_ids include both an offset and a trailing Z (invalid
+        # ISO-8601 but present in existing data). Strip the Z and retry.
+        if round_id.endswith("Z"):
+            try:
+                dt = datetime.fromisoformat(round_id[:-1])
+            except (ValueError, TypeError):
+                return {"valid": False, "error": f"round_id is not a valid ISO-8601 timestamp: '{round_id}'"}
+        else:
+            return {"valid": False, "error": f"round_id is not a valid ISO-8601 timestamp: '{round_id}'"}
 
     # Must include timezone to prevent ambiguity
     if dt.tzinfo is None:

@@ -87,7 +87,7 @@ python -m neurons.miner
 | `PLATFORM_URL` | https://api.theminos.ai | Platform API URL |
 | `PLATFORM_TIMEOUT` | 60 | Platform API request timeout (seconds) |
 | `MINER_TEMPLATE` | gatk | Variant calling tool: `gatk`, `deepvariant`, `freebayes`, or `bcftools` |
-| `STORAGE_PRIMARY_BACKEND` | hippius | File download order: `hippius` tries Hippius SN75 first (fallback S3), `aws_s3` tries S3 first |
+| `STORAGE_PRIMARY_BACKEND` | hippius | Storage preference: `hippius` tries Hippius SN75 first (Bittensor decentralized, recommended). `aws_s3` reverses the order. |
 
 ## Validator (validator.py)
 
@@ -113,10 +113,11 @@ A validator uses miners config file and selected hyperparameters to run the vari
 
 3. **Backfill and Update Weights**
    - After scoring window closes, fetch peer scores for miners not personally covered
-   - Track scores with EMA (exponential moving average)
-   - Winner-takes-all: best eligible miner gets 100% weight
-   - Submit weights to Bittensor blockchain
-   - Submit scores to platform for aggregation
+   - Track personal and backfilled scores with EMA (exponential moving average)
+   - Record round participation once with the complete personal + backfilled hotkey set
+   - Compute warmup split or winner-takes-all weights from EMA
+   - Submit weight history to the platform for aggregation/dashboarding
+   - Submit weights to Bittensor blockchain only when the validator hotkey is registered
 
 ### Running the Validator
 
@@ -160,11 +161,12 @@ python -m neurons.validator
 | `WALLET_HOTKEY` | default | Bittensor hotkey name |
 | `PLATFORM_URL` | https://api.theminos.ai | Platform API URL |
 | `PLATFORM_TIMEOUT` | 60 | Platform API request timeout (seconds) |
-| `STORAGE_PRIMARY_BACKEND` | hippius | File download order: `hippius` tries Hippius SN75 first (fallback S3), `aws_s3` tries S3 first |
+| `STORAGE_PRIMARY_BACKEND` | hippius | Storage preference: `hippius` tries Hippius SN75 first (Bittensor decentralized, recommended). `aws_s3` reverses the order. |
 | `EMA_ALPHA` | 0.1 | EMA smoothing factor (higher = more weight on recent scores) |
 | `EMA_DECAY_FACTOR` | 0.95 | EMA decay multiplier applied per missed round |
-| `SCORING_THREADS` | 4 | Fixed thread count for reproducible scoring |
-| `SCORING_MEMORY_GB` | 8 | Fixed memory (GB) for scoring Docker containers |
+| `SCORING_THREADS` | auto | Override: threads per scoring Docker job. Auto-tuned from cores (clamped 2–8) |
+| `SCORING_MEMORY_GB` | 16 | Override: memory per scoring Docker job. **Below 16 OOM-crashes DeepVariant** |
+| `MINOS_VALIDATOR_CONCURRENCY` | auto | Override: concurrent miner jobs. Auto = `min(cores//threads, ram_gb//16, 8)` |
 
 ## The Complete Cycle
 
@@ -216,9 +218,9 @@ python -m neurons.validator
 
 Weights are assigned in two phases:
 
-**Warmup** (until any miner has scored in ≥10 rounds): reward is split among the top 3 miners by EMA score — 50% to 1st, 30% to 2nd, 20% to 3rd. Scores within 0.5% of each other are tiebroken by earliest submission time.
+**Warmup** (before any miner has scored in ≥10 rounds): reward is split among the top 3 active miners with positive EMA — 50% to 1st, 30% to 2nd, 20% to 3rd, renormalized if fewer than three qualify. Scores within 0.5% of each other are tiebroken by earliest submission time.
 
-**Normal** (once any miner reaches eligibility): the single top-performing eligible miner by EMA receives 100% of the weight. Eligibility requires scoring in at least 10 of the last 20 rounds. Absent miners' EMA decays each round they miss (×0.95). Tiebreaker: earliest submission timestamp (applied only at floating-point tolerance).
+**Normal** (once any miner reaches eligibility): the single top-performing eligible miner by EMA receives 100% of the weight. Eligibility requires scoring in at least 10 of the last 20 rounds; ineligible miners receive 0 weight in normal mode. Absent miners' EMA decays each round they miss (×0.95). Tiebreaker: earliest submission timestamp (applied only at floating-point tolerance).
 
 ## Requirements
 

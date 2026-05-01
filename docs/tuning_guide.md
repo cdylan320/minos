@@ -13,13 +13,13 @@ Validators compare your VCF output against a truth VCF using **hap.py** (the GA4
 | Component    | Weight | What It Measures                                          |
 |--------------|--------|-----------------------------------------------------------|
 | Core F1      | 60%    | Truth-weighted F1 score (emphasis gamma = 0.5)            |
-| Completeness | 15%    | Recall + coverage (emphasis gamma = 3.0)                  |
+| Completeness | 15%    | Recall (emphasis gamma = 3.0) + coverage (gamma = 2.0)    |
 | FP Rate      | 15%    | Penalizes false positive rate above a dynamic threshold   |
 | Quality      | 10%    | Ti/Tv ratio and Het/Hom ratio deviation penalties         |
 
 **Core F1** dominates. Get your precision and recall right first; everything else is refinement.
 
-**FP Rate** uses a dynamic threshold based on truth set size (typically ~0.2-1.0%). The penalty is an exponential decay — exceeding the threshold does not instantly zero your score, but it ramps quickly. Calling too aggressively will hurt you here.
+**FP Rate** uses a dynamic threshold computed as `max(0.2%, 1 / truth_count)` — so the floor is 0.2% and it widens for small truth sets. The penalty is an exponential decay — exceeding the threshold does not instantly zero your score, but it ramps quickly. Calling too aggressively will hurt you here.
 
 **Completeness** rewards finding more true variants. Over-filtering to reduce FPs will cost you here — it is a balancing act.
 
@@ -32,13 +32,29 @@ The AdvancedScorer outputs a raw score on a 0–100 scale. This is normalized to
 - A single bad round does not destroy you, but persistent low scores will drag your EMA down.
 - It takes roughly 10 rounds for the EMA to mostly reflect your current performance.
 - Missing rounds applies a decay factor of 0.95 per missed round to your EMA.
-- When reading logs: `Score: 85.00/100  EMA: 0.8500` — the score is 0–100, the EMA is 0–1.
+- When reading logs: `Score: 85.00/100  EMA: 0.0850` is a typical first-round result with alpha = 0.1. The score is 0–100; the EMA is 0–1 and moves gradually.
 
-**Warmup phase** (until any miner has participated in 10+ rounds): rewards are split among the top 3 miners by EMA — 50% to 1st, 30% to 2nd, 20% to 3rd.
+**Warmup phase** (until any miner has participated in 10+ rounds): rewards are split among the top 3 active miners by EMA — 50% to 1st, 30% to 2nd, 20% to 3rd, renormalized if fewer than three active miners have positive EMA.
 
-**Normal phase** (after warmup): **winner-takes-all** — the miner with the highest EMA gets 100% of emissions for that validator. Second place gets nothing.
+**Normal phase** (after warmup): **winner-takes-all** among eligible miners — the eligible miner with the highest EMA gets 100% of emissions for that validator. Ineligible miners and second place get 0.
 
 Consistency matters as much as peak performance.
+
+### Why Is My Weight 0?
+
+This is the most common question for new miners. There are three distinct causes; check them in this order.
+
+**1. You are not eligible yet (most likely).** Eligibility requires participating in **at least 10 of the last 20 rounds**. With ~20 rounds per day, a fresh miner needs roughly 12 hours of continuous uptime before they can earn any weight, even with perfect scores. During this time you appear in validator logs but receive 0 weight. This is expected.
+
+**2. You are eligible but a competitor has a higher EMA.** Once eligible, weights are winner-takes-all. If another miner has a higher EMA than yours (even by a tiny margin), they get 100% and you get 0. The fix is to score better — see Section 4 (Tuning Strategy).
+
+**3. You are submitting but the score is 0.** Causes: wrong reference build, malformed VCF (multi-sample, missing index), tool config rejected by the parameter whitelist, or a Docker error. Check your logs for the line `Score: 0.00/100`. If you see it, the variant call ran but produced no usable output. If you do not see a score line at all, your submission never made it to the scoring phase — check the platform connectivity / round timing.
+
+A useful sanity check: if your logs show `Submitted config for round 2026-XX-XXTXX:XX:XX (variants=N)` with a non-zero N, you are participating. The eligibility counter is what will catch up over time.
+
+### What If I Restart Mid-Round?
+
+The EMA state is recovered from the platform on startup, so your historical performance is not lost. Already-scored miners in the current round are skipped on the next pass — no double-scoring or wasted compute. There is no manual recovery step needed.
 
 ---
 

@@ -175,6 +175,30 @@ check_python() {
 
 # --- Docker check/install ---
 
+check_zstd() {
+    # zstd is used by setup.py to extract the optional reference-data archive
+    # (validators only). Per-file fallback works without it; this is a soft
+    # dependency, install is best-effort.
+    if command -v zstd &>/dev/null; then
+        return
+    fi
+
+    info "Installing zstd (used for fast reference-data archive extract)..."
+    case "$PKG_MANAGER" in
+        apt)
+            sudo apt-get update -qq 2>/dev/null
+            sudo apt-get install -y -qq zstd 2>/dev/null && ok "zstd installed" || warn "zstd install failed; archive download will fall back to per-file"
+            ;;
+        dnf|yum)
+            sudo "$PKG_MANAGER" makecache -q 2>/dev/null
+            sudo "$PKG_MANAGER" install -y -q zstd 2>/dev/null && ok "zstd installed" || warn "zstd install failed; archive download will fall back to per-file"
+            ;;
+        brew) brew install zstd 2>/dev/null && ok "zstd installed" || warn "zstd install failed; archive download will fall back to per-file" ;;
+        *) warn "zstd not present and package manager unknown; archive download will fall back to per-file" ;;
+    esac
+}
+
+
 check_docker() {
     header "Checking Docker"
 
@@ -467,6 +491,7 @@ main() {
     if [[ "$fresh" == "false" ]] && [[ -f "$venv_dir/bin/activate" ]] && [[ -f "$env_file" ]]; then
         detect_os
         check_python
+        check_zstd
         check_docker
         update_only
         echo ""
@@ -477,6 +502,7 @@ main() {
     # Full install
     detect_os
     check_python
+    check_zstd
     check_docker
     setup_venv
     install_deps

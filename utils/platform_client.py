@@ -1,5 +1,7 @@
 """Platform API client for Minos miners and validators."""
 
+import gzip
+import io
 import os
 import time
 import asyncio
@@ -11,6 +13,8 @@ import httpx
 from typing import Optional, Dict, Any, List, Callable, TypeVar
 from dataclasses import dataclass
 from bittensor_wallet import Keypair
+
+from utils.path_utils import safe_round_dir_name
 
 logger = logging.getLogger(__name__)
 
@@ -511,22 +515,121 @@ class ValidatorPlatformClient(PlatformClient):
             logger.error(f"Failed to upload {local_path} to S3: {e}")
             return False
 
+    # Wire-format version for the gzipped NDJSON variant-results file.
+    # Bumped if the on-disk format changes; the platform validates against
+    # its known set so a stale validator can't poison the column.
+    _VARIANT_RESULTS_FORMAT_VERSION = "ndjson-gz-v1"
+
+    @staticmethod
+    def _serialize_variant_results_ndjson_gz(
+        records: List[Dict[str, Any]],
+    ) -> bytes:
+        """Encode variant records as gzipped NDJSON.
+
+        One JSON object per line, UTF-8, trailing newline. Compact JSON
+        (no spaces) keeps wire size minimal; gzip on top compresses the
+        repeated field names roughly 8-10x.
+        """
+        buf = io.BytesIO()
+        # mtime=0 keeps the gzip header byte-for-byte deterministic so the
+        # same input produces the same SHA-256 across runs (useful for
+        # idempotency / dedup logic on the platform side).
+        with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=6, mtime=0) as gz:
+            for record in records:
+                line = json.dumps(record, separators=(",", ":"), ensure_ascii=False)
+                gz.write(line.encode("utf-8"))
+                gz.write(b"\n")
+        return buf.getvalue()
+
+    @staticmethod
+    def _sha256_hex(data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    async def _put_bytes_to_presigned(
+        self,
+        presigned_url: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+    ) -> bool:
+        """PUT raw bytes to a presigned URL. Mirrors upload_file_to_s3 but
+        operates on an in-memory buffer (no local file)."""
+        try:
+            async with self._get_client() as client:
+                response = await client.put(
+                    presigned_url,
+                    content=data,
+                    headers={"Content-Type": content_type},
+                    timeout=300.0,
+                )
+            if response.status_code in (200, 201, 204):
+                return True
+            logger.error(
+                f"Presigned PUT failed ({response.status_code}): "
+                f"{response.text[:200]}"
+            )
+            return False
+        except Exception as e:
+            logger.error(f"Presigned PUT raised: {e}")
+            return False
+
     async def submit_variant_results(
         self,
         score_id: str,
-        results: List[Dict[str, Any]]
+        round_id: str,
+        results: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Submit per-variant classification results from hap.py.
+        """Upload per-variant TP/FP/FN breakdown to object storage and
+        record the pointer on the platform.
+
+        Flow:
+          1. Serialize ``results`` as gzipped NDJSON in memory
+          2. Compute SHA-256 of the gzipped bytes
+          3. Build s3_key under ``scoring/{hotkey}/{round_slug}/`` so the
+             /v2/get-upload-url prefix check accepts it
+          4. Ask the platform for a presigned PUT URL (cascade R2 ->
+             Hippius -> AWS is decided server-side)
+          5. PUT the gzipped bytes to that URL
+          6. POST {score_id, s3_key, sha256, record_count, format_version}
+             to /v2/submit-variant-results
 
         Args:
-            score_id: UUID of the validator_score this belongs to
-            results: List of variant result dicts with keys:
-                     chrom, pos, ref, alt, variant_type, classification,
-                     quality, filter_status
+            score_id: UUID of the validator_score this belongs to.
+            round_id: Round identifier (used to slug the S3 key prefix).
+            results: List of variant-result dicts (chrom, pos, ref, alt,
+                variant_type, classification, plus optional call-level
+                fields). Empty list is accepted but the upload is still
+                recorded as record_count=0.
 
         Returns:
-            Dict with success and variants_stored count
+            The platform's JSON response (success, s3_key, record_count).
         """
+        # 1+2. Serialize and hash. Both are deterministic for a given input.
+        payload = self._serialize_variant_results_ndjson_gz(results)
+        sha256 = self._sha256_hex(payload)
+
+        # 3. S3 key under the validator's prefix. safe_round_dir_name() is
+        # the same slug used elsewhere for round artifacts so directory
+        # listings stay tidy.
+        round_slug = safe_round_dir_name(round_id)
+        s3_key = (
+            f"scoring/{self.keypair.ss58_address}/{round_slug}"
+            f"/variant_results_{score_id}.ndjson.gz"
+        )
+
+        # 4. Get a presigned PUT URL from the platform (it picks the backend).
+        presigned_url = await self.get_upload_url(s3_key)
+
+        # 5. PUT the bytes. Failure here means we never recorded anything;
+        # the validator's outer try/except will log and continue.
+        ok = await self._put_bytes_to_presigned(
+            presigned_url, payload, content_type="application/x-ndjson"
+        )
+        if not ok:
+            raise PlatformClientError(
+                f"Failed to upload variant-results file to {s3_key}"
+            )
+
+        # 6. Record the pointer.
         path = "/v2/submit-variant-results"
 
         async def _do_request():
@@ -534,21 +637,28 @@ class ValidatorPlatformClient(PlatformClient):
                 "POST", path,
                 score_id=score_id,
                 validator_hotkey=self.keypair.ss58_address,
-                results=results,
+                s3_key=s3_key,
+                sha256=sha256,
+                record_count=len(results),
+                format_version=self._VARIANT_RESULTS_FORMAT_VERSION,
             )
 
             async with self._get_client() as client:
                 response = await client.post(
-                    path, json=body, headers=self._AUTH_HEADERS, timeout=60.0
+                    path, json=body, headers=self._AUTH_HEADERS, timeout=30.0
                 )
 
                 if response.status_code == 401:
-                    raise AuthenticationError("Invalid signature or validator not authorized")
+                    raise AuthenticationError(
+                        "Invalid signature or validator not authorized"
+                    )
                 if response.status_code == 404:
                     raise PlatformClientError("Score not found")
                 if response.status_code != 200:
-                    raise PlatformClientError(f"Failed to submit variant results: {response.text}")
-
+                    raise PlatformClientError(
+                        f"Failed to record variant-results pointer: "
+                        f"{response.text}"
+                    )
                 return response.json()
 
         return await retry_async(_do_request, max_retries=2)

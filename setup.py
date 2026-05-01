@@ -20,6 +20,7 @@ import shlex
 import platform
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Callable
@@ -113,7 +114,10 @@ VALIDATOR_DOCKER_IMAGES = [
 
 # Supported chromosomes
 SUPPORTED_CHROMOSOMES = [f"chr{i}" for i in range(1, 23)]  # chr1-chr22
-REF_S3_BASE = "https://genotypenet-platform.s3.us-east-1.amazonaws.com/reference_data/donors/reference"
+# Permanent indirected URL — platform 302-redirects to the actual storage
+# backend (R2 today, anything tomorrow). Lets us swap providers without
+# requiring miner/validator setup-script updates.
+REF_S3_BASE = "https://api.theminos.ai/reference"
 
 # Reference data files per role — multi-chromosome (chr1-chr22)
 # Estimated sizes in MB for user feedback
@@ -144,18 +148,41 @@ def _build_miner_data_files():
 
 MINER_DATA_FILES = _build_miner_data_files()
 
+# Files that make up an RTG SDF directory (vcfeval template). Match the
+# layout produced by `rtg format` and stored unpacked on R2/AWS.
+#
+# seqdata0 is the only large file (~24MB for chr20, ~250MB for chr1).
+# Everything else is tiny indexes/markers (<1MB each).
+#
+# format.log is intentionally excluded: it's a non-essential log of the
+# `rtg format` command (RTG/vcfeval works fine without it), and CloudFront
+# WAFs commonly block .log extensions by default. Dockerfile tolerates its
+# absence too (`|| true` on its wget).
+_SDF_FILES = [
+    "done", "mainIndex",
+    "nameIndex0", "namedata0", "namepointer0",
+    "progress", "seqdata0", "seqpointer0",
+    "sequenceIndex0", "summary.txt",
+]
+
+
 def _build_validator_data_files():
     """Validators need reference + SDF for all chromosomes.
-    Truth VCFs are served per-round from the platform API — not stored locally."""
+    Truth VCFs are served per-round from the platform API — not stored locally.
+
+    SDF directories are stored UNPACKED on R2 (no .tar.gz exists). We download
+    each file individually under datasets/reference/{chr}/{chr}.sdf/.
+    """
     files = list(MINER_DATA_FILES)
     for chrom in SUPPORTED_CHROMOSOMES:
-        files.append({
-            "name": f"{chrom} RTG SDF Template",
-            "local": f"datasets/reference/{chrom}/{chrom}.sdf",
-            "url": f"{REF_S3_BASE}/{chrom}/{chrom}.sdf.tar.gz",
-            "size_mb": 200,
-            "extract": True,
-        })
+        for sdf_file in _SDF_FILES:
+            files.append({
+                "name": f"{chrom} SDF {sdf_file}",
+                "local": f"datasets/reference/{chrom}/{chrom}.sdf/{sdf_file}",
+                "url": f"{REF_S3_BASE}/{chrom}/{chrom}.sdf/{sdf_file}",
+                # seqdata0 dominates — ~24MB chr20, ~250MB chr1. Others <1MB.
+                "size_mb": 250 if sdf_file == "seqdata0" else 1,
+            })
     return files
 
 VALIDATOR_DATA_FILES = _build_validator_data_files()
@@ -731,6 +758,57 @@ class SetupWizard:
 
             self.console.print("  [green]Migration complete — chr20 data moved to datasets/reference/chr20/[/]")
 
+    def _try_archive_download(self, target_dir: Path) -> bool:
+        """Stream-download and extract the bundled tar.zst reference archive.
+
+        Returns True if extraction completed (curl + tar both exit 0). The
+        caller is responsible for verifying every required file is on disk
+        afterwards — a stale or partial archive can extract cleanly but be
+        missing chromosomes or SDF files. Falls back to per-file download
+        anywhere it returns False.
+
+        Used for validators (where archive saves ~10 minutes); miners stick
+        with per-file because their dataset is small and the archive contains
+        validator-only SDF files they don't need.
+        """
+        if shutil.which("zstd") is None:
+            self.console.print("  [dim]zstd not installed — using per-file download[/]")
+            return False
+
+        archive_url = f"{REF_S3_BASE}/reference-grch38-v1.tar.zst"
+        self.console.print(f"  [cyan]Trying single-archive install (~1.8 GB compressed)...[/]")
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        curl = tar = None
+        try:
+            curl = subprocess.Popen(
+                ["curl", "-fsSL", archive_url],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            tar = subprocess.Popen(
+                ["tar", "--use-compress-program=zstd -d", "-xf", "-", "-C", str(target_dir)],
+                stdin=curl.stdout, stderr=subprocess.PIPE,
+            )
+            curl.stdout.close()
+            _, tar_err = tar.communicate(timeout=900)
+            curl_rc = curl.wait(timeout=10)
+        except Exception as e:
+            self.console.print(f"  [yellow]Archive download failed ({type(e).__name__}); falling back to per-file[/]")
+            for p in (curl, tar):
+                if p and p.poll() is None:
+                    p.kill()
+            return False
+
+        if curl_rc != 0 or tar.returncode != 0:
+            err = (tar_err or b"").decode("utf-8", errors="replace")[-200:]
+            self.console.print(f"  [yellow]Archive extract failed (curl={curl_rc}, tar={tar.returncode}); falling back to per-file[/]")
+            if err.strip():
+                self.console.print(f"  [dim]{err.strip()}[/]")
+            return False
+
+        self.console.print("  [green]Archive extracted[/]")
+        return True
+
     def step_reference_data(self) -> StepResult:
         # Migrate old flat chr20 structure if detected
         self._migrate_legacy_reference_data()
@@ -780,6 +858,38 @@ class SetupWizard:
             self.console.print("  [yellow]Skipping. Download files before running.[/]")
             return StepResult(skipped=True)
 
+        # Validators with most files missing: try the bundled archive first
+        # (single ~1.8 GB download vs ~280 individual files). Miners skip this
+        # because their dataset is small and the archive includes SDF files
+        # they don't need.
+        if self.state.role == "validator" and len(to_download) >= 50:
+            if self._try_archive_download(BASE_DIR / "datasets" / "reference"):
+                # Re-verify every required file. A stale or partial archive
+                # could extract cleanly but be missing chromosomes / SDF files,
+                # so we re-check disk state and only consider files still
+                # missing as the new to_download list. The remainder falls
+                # through to per-file download below.
+                still_missing = []
+                for f in files:
+                    local_path = BASE_DIR / f["local"]
+                    if f.get("extract"):
+                        if not (local_path.exists() and local_path.is_dir() and any(local_path.iterdir())):
+                            still_missing.append(f)
+                    elif not (local_path.exists() and local_path.stat().st_size > 0):
+                        still_missing.append(f)
+
+                if not still_missing:
+                    self.console.print("  [green]Archive install complete; all reference files verified[/]")
+                    self.state.reference_data_ready = True
+                    return StepResult()
+
+                self.console.print(
+                    f"  [yellow]Archive extracted but {len(still_missing)} file(s) still missing; "
+                    f"completing via per-file download[/]"
+                )
+                to_download = still_missing
+            # Archive failed or incomplete — fall through to per-file download
+
         # Try to use existing download_file, fall back to urllib
         download_fn = self._get_download_function()
 
@@ -827,6 +937,7 @@ class SetupWizard:
             "WALLET_HOTKEY": self.state.wallet_hotkey,
             "PLATFORM_URL": PLATFORM_URL,
             "PLATFORM_TIMEOUT": "60",
+            "STORAGE_PRIMARY_BACKEND": "hippius",
         }
 
         if self.state.role == "miner":
@@ -844,6 +955,7 @@ class SetupWizard:
             ("Bittensor", ["NETUID", "NETWORK", "WALLET_NAME", "WALLET_HOTKEY"]),
             ("Miner", ["MINER_TEMPLATE"]),
             ("Platform", ["PLATFORM_URL", "PLATFORM_TIMEOUT"]),
+            ("Storage", ["STORAGE_PRIMARY_BACKEND"]),
         ]
 
         for section_name, keys in sections:
@@ -1241,7 +1353,12 @@ class SetupWizard:
             return False
 
     def _get_download_function(self):
-        """Return a download function. Tries file_utils first, falls back to urllib."""
+        """Return a download function with one transparent retry on failure.
+
+        Tries file_utils first, falls back to urllib. Wraps the chosen
+        downloader so a single transient failure (network blip, slow first
+        byte) doesn't fail the whole setup step.
+        """
         try:
             sys.path.insert(0, str(BASE_DIR))
             from utils.file_utils import download_file
@@ -1250,34 +1367,47 @@ class SetupWizard:
                 result = download_file(url, path, use_cache=False, show_progress=True)
                 return result is not None and result.exists()
 
-            return _download
+            base_fn = _download
         except ImportError:
-            pass
+            # Fallback: urllib with progress reporting
+            def _download_urllib(url: str, path: Path) -> bool:
+                import urllib.request
 
-        # Fallback: urllib with progress reporting
-        def _download_urllib(url: str, path: Path) -> bool:
-            import urllib.request
+                try:
+                    self.console.print(f"  [dim]{url}[/]")
 
-            try:
-                self.console.print(f"  [dim]{url}[/]")
+                    def _reporthook(block_num, block_size, total_size):
+                        if total_size > 0:
+                            downloaded = block_num * block_size
+                            pct = min(100, downloaded * 100 // total_size)
+                            mb_done = downloaded / (1024 * 1024)
+                            mb_total = total_size / (1024 * 1024)
+                            print(f"\r  {mb_done:.1f}/{mb_total:.1f} MB ({pct}%)", end="", flush=True)
 
-                def _reporthook(block_num, block_size, total_size):
-                    if total_size > 0:
-                        downloaded = block_num * block_size
-                        pct = min(100, downloaded * 100 // total_size)
-                        mb_done = downloaded / (1024 * 1024)
-                        mb_total = total_size / (1024 * 1024)
-                        print(f"\r  {mb_done:.1f}/{mb_total:.1f} MB ({pct}%)", end="", flush=True)
+                    urllib.request.urlretrieve(url, str(path), reporthook=_reporthook)
+                    print()  # newline after progress
+                    return path.exists()
+                except Exception as e:
+                    print()  # newline after progress
+                    self.console.print(f"  [red]Download error: {e}[/]")
+                    return False
 
-                urllib.request.urlretrieve(url, str(path), reporthook=_reporthook)
-                print()  # newline after progress
-                return path.exists()
-            except Exception as e:
-                print()  # newline after progress
-                self.console.print(f"  [red]Download error: {e}[/]")
-                return False
+            base_fn = _download_urllib
 
-        return _download_urllib
+        def _with_retry(url: str, path: Path) -> bool:
+            if base_fn(url, path):
+                return True
+            # Clean up any partial file so the retry starts fresh
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            self.console.print("  [yellow]Download failed, retrying once in 3s...[/]")
+            time.sleep(3)
+            return base_fn(url, path)
+
+        return _with_retry
 
     def _download_and_extract(self, download_fn, url: str, target_dir: Path) -> bool:
         """Download a tarball and extract it to target_dir (for RTG SDF directories)."""
