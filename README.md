@@ -43,7 +43,7 @@ Minos (SN107) is a subnet for genomic variant calling and benchmarking powered b
 ├────────────────────────────────────────────────────────────-─┤
 │  • Prepares BAMs with synthetic mutations using HelixForge   │
 │  • Presigned URL generation for BAM transfer                 │
-│    (AWS S3 + Hippius SN75 decentralized storage)             │
+│    (Hippius SN75 + Cloudflare R2 + AWS S3 fallback)          │
 │  • Continuous 72-minute rounds aligned to Bittensor tempo    │
 │  • Lag scoring: miners submit in cycle N, validators score   │
 │    cycle N while miners work on cycle N+1                    │
@@ -95,8 +95,7 @@ minos_subnet/
 │   ├── file_utils.py         # SHA256-verified file download + caching
 │   └── README.md             # Utils documentation
 ├── base/                     # Core subnet config
-│   ├── genomics_config.py    # Central config (Docker images, timeouts, EMA params)
-│   └── s3_manifest.json      # Reference data paths (local + S3)
+│   └── genomics_config.py    # Central config (Docker images, timeouts, EMA params)
 ├── configs/                  # Miner-tunable quality parameters
 │   ├── gatk.conf
 │   ├── deepvariant.conf
@@ -136,7 +135,7 @@ minos_subnet/
 | OS | Linux (Ubuntu 20.04+), macOS 13+ | Docker + Bittensor run best on Linux |
 | CPU/RAM (Validator) | ≥8 cores / 32 GB RAM | hap.py scoring benefits from cores |
 | CPU/RAM (Miner) | ≥4 cores / 8–16 GB RAM | 8 GB for BCFtools/FreeBayes, 16 GB for DeepVariant |
-| Disk | ≥60 GB (miner) / ≥100 GB (validator) | Reference data ~9 GB + temporary files |
+| Disk | ≥60 GB (miner) / ≥100 GB (validator) | Reference: ~2 GB miner, ~14 GB validator (SDF expands ~6×). Plus per-round BAMs (~6 GB each) until cleaned. |
 | Docker | 20.10+ (24.0+ recommended) | Required for GATK, hap.py, bcftools |
 | Python | 3.10+ | We test on 3.12 |
 | Bittensor | Latest pip install | Provides wallet/subtensor/dendrite APIs |
@@ -251,7 +250,8 @@ WALLET_HOTKEY=default
 PLATFORM_URL=https://api.theminos.ai
 PLATFORM_TIMEOUT=60
 
-# Storage backend preference (hippius = Hippius SN75 first, aws_s3 = S3 first) # we recommend hippius.
+# Storage preference: hippius = Hippius SN75 first (recommended, Bittensor decentralized).
+# aws_s3 = R2/AWS first. Both serve the same files; this just controls fetch order.
 STORAGE_PRIMARY_BACKEND=hippius
 ```
 
@@ -285,6 +285,26 @@ python -m neurons.validator \
 5. **Submit Scores**: Report scores back to platform
 6. **Weight Update**: Set weights on-chain via Bittensor
 
+### Validator Parallelism
+
+Each round, the validator runs many miners' variant-calling configs concurrently. Concurrency, per-job thread count, and memory ceiling are auto-tuned at startup from host CPU/RAM:
+
+- Reserves 4 cores + 16 GB for the OS, Docker daemon, and hap.py
+- Picks `threads_per_job` between 2 and 8 (DeepVariant's call_variants is single-threaded past 8)
+- Pins memory at 16 GB per job (DeepVariant's documented minimum)
+- `concurrency = min(usable_cores // threads_per_job, usable_ram // 16, 8)`
+
+Examples:
+
+| Host | Auto-tune |
+|---|---|
+| 8c / 32 GB | 1 concurrent × 2 threads × 16 GB |
+| 16c / 64 GB | 3 concurrent × 3 threads × 16 GB |
+| 32c / 128 GB | 4 concurrent × 7 threads × 16 GB |
+| 64c / 256 GB | 7 concurrent × 8 threads × 16 GB |
+
+To override, set `MINOS_VALIDATOR_CONCURRENCY`, `SCORING_THREADS`, or `SCORING_MEMORY_GB` in `.env`. Note `SCORING_MEMORY_GB < 16` will OOM-crash DeepVariant submissions.
+
 ---
 
 ## Miner Setup
@@ -306,7 +326,8 @@ MINER_TEMPLATE=gatk
 PLATFORM_URL=https://api.theminos.ai
 PLATFORM_TIMEOUT=60
 
-# Storage backend preference (hippius = Hippius SN75 first, aws_s3 = S3 first) # we recommend hippius
+# Storage preference: hippius = Hippius SN75 first (recommended, Bittensor decentralized).
+# aws_s3 = R2/AWS first. Both serve the same files; this just controls fetch order.
 STORAGE_PRIMARY_BACKEND=hippius
 ```
 
@@ -360,6 +381,25 @@ The Minos Platform is a hosted service at `https://api.theminos.ai` that handles
 | `POST /v2/submit-weight-history`| Validator | Submit EMA scores and weights after round      |
 | `POST /v2/get-validator-state`  | Validator | Recover EMA state after validator restart       |
 
+### Storage Backends
+
+The platform serves all per-round files (BAMs, truth VCFs, mutations VCFs) via short-lived presigned URLs and a primary + backup pair, so a miner or validator never needs storage credentials of its own. Three backends sit behind the platform:
+
+| Backend          | Role                                                                          |
+|------------------|-------------------------------------------------------------------------------|
+| Cloudflare R2    | Primary for per-round artifacts when enabled platform-side (free egress)      |
+| AWS S3           | Fallback for per-round artifacts (`genotypenet-platform` bucket)              |
+| Hippius (SN75)   | Decentralized backup, Bittensor-native (`genotypenet-mutations` bucket)       |
+
+Reference data (FASTA, FAI, dict, RTG SDF) is served via the indirected URL `https://api.theminos.ai/reference/...` which 302-redirects to the active backend (currently a public R2 bucket). Setup downloads through this URL only — no direct R2/S3 hostnames are baked into the subnet code.
+
+The `STORAGE_PRIMARY_BACKEND` env var only controls **fetch order on the client side**:
+
+- `hippius` (default) — try the Hippius URL first, fall back to the R2/AWS URL.
+- `aws_s3` — try the R2/AWS URL first, fall back to Hippius. (The label says "aws_s3" for backwards compatibility, but the platform may serve either R2 or AWS in this slot — both behave identically from the client's perspective.)
+
+Both URLs always point at the same files. Pick whichever is faster from your network.
+
 ---
 
 ## Scoring System
@@ -404,13 +444,18 @@ In the warmup phase, miners with scores within 0.5% of each other are tiebroken 
 
 ### Common Issues
 
-| Symptom                     |   Cause                            |  Fix                                                |
-|-----------------------------|------------------------------------|-----------------------------------------------------|
-| `docker: permission denied` | User not in docker group           | `sudo usermod -aG docker $USER && newgrp docker`    |
-| `GATK timeout`              | Insufficient resources             | Increase threads/memory or timeout                  |
-| `Platform 401 error`        | Invalid sig or unregistered hotkey | Ensure wallet hotkey is registered on the metagraph |
-| `No miners available`       | No registered miners               | Check metagraph for active miners                   |
-| `hap.py zero scores`        | VCF format issues                  | Ensure single-sample VCF output                     |
+| Symptom                       | Cause                                      | Fix                                                                                                              |
+|-------------------------------|--------------------------------------------|------------------------------------------------------------------------------------------------------------------|
+| `docker: permission denied`   | User not in docker group                   | `sudo usermod -aG docker $USER && newgrp docker`                                                                 |
+| `GATK timeout`                | Insufficient resources                     | Increase threads/memory or timeout                                                                               |
+| DeepVariant OOM / killed      | <16 GB available to the container          | DeepVariant needs ≥16 GB. Free RAM, close other tools, or switch template to GATK/FreeBayes/BCFtools             |
+| `Platform 401 error`          | Invalid sig or unregistered hotkey         | Ensure wallet hotkey is registered on the metagraph                                                              |
+| `No miners available`         | No registered miners                       | Check metagraph for active miners                                                                                |
+| `hap.py zero scores`          | VCF format issues                          | Ensure single-sample VCF output                                                                                  |
+| Round skipped, "<10min left"  | Submitted too late                         | Miner needs ≥10 min remaining to start a round. Check clock skew (`timedatectl`) and platform connectivity speed |
+| Reference download stuck/slow | Platform redirect or transient network     | Setup retries once automatically. If it still fails, re-run `bash install.sh --update-only`                      |
+| Validator: "no scoring rounds"| Round still in submission window           | Validators only score AFTER the submission window closes. Wait for the next tempo boundary                       |
+| Earning 0 weight as miner     | Not yet eligible (warmup phase)            | Need >=10 of last 20 rounds participated. See [tuning_guide](docs/tuning_guide.md) "Why is my weight 0?"         |
 
 ### Logs
 

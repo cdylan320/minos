@@ -21,7 +21,7 @@ show_help() {
     echo "Options:"
     echo "  --wallet-name <name>        Wallet name"
     echo "  --wallet-hotkey <name>      Hotkey name"
-    echo "  --storage <backend>         Storage backend: hippius, aws_s3"
+    echo "  --storage <backend>         Fetch order: hippius (default) or aws_s3 (R2/AWS first)"
     echo "  --setup                     Re-run interactive setup wizard"
     echo "  --help                      Show this help message"
     echo ""
@@ -198,15 +198,15 @@ if [ ! -f .env ] || [ "$RUN_SETUP" = true ]; then
         fi
     fi
 
-    # Generate .env
+    # Per-job scoring resources auto-tune from host CPU/RAM at startup.
+    # Override via SCORING_THREADS, SCORING_MEMORY_GB (>=16 for DeepVariant),
+    # or MINOS_VALIDATOR_CONCURRENCY.
     cat > .env << EOF
 NETUID=107
 WALLET_NAME=$WALLET_NAME
 WALLET_HOTKEY=$HOTKEY_NAME
 PLATFORM_URL=https://api.theminos.ai
 PLATFORM_TIMEOUT=60
-SCORING_THREADS=4
-SCORING_MEMORY_GB=8
 STORAGE_PRIMARY_BACKEND=${DEFAULT_STORAGE}
 EOF
 

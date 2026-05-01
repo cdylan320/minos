@@ -87,7 +87,7 @@ python -m neurons.miner
 | `PLATFORM_URL` | https://api.theminos.ai | Platform API URL |
 | `PLATFORM_TIMEOUT` | 60 | Platform API request timeout (seconds) |
 | `MINER_TEMPLATE` | gatk | Variant calling tool: `gatk`, `deepvariant`, `freebayes`, or `bcftools` |
-| `STORAGE_PRIMARY_BACKEND` | hippius | File download order: `hippius` tries Hippius SN75 first (fallback S3), `aws_s3` tries S3 first |
+| `STORAGE_PRIMARY_BACKEND` | hippius | Storage preference: `hippius` tries Hippius SN75 first (Bittensor decentralized, recommended). `aws_s3` reverses the order. |
 
 ## Validator (validator.py)
 
@@ -160,11 +160,12 @@ python -m neurons.validator
 | `WALLET_HOTKEY` | default | Bittensor hotkey name |
 | `PLATFORM_URL` | https://api.theminos.ai | Platform API URL |
 | `PLATFORM_TIMEOUT` | 60 | Platform API request timeout (seconds) |
-| `STORAGE_PRIMARY_BACKEND` | hippius | File download order: `hippius` tries Hippius SN75 first (fallback S3), `aws_s3` tries S3 first |
+| `STORAGE_PRIMARY_BACKEND` | hippius | Storage preference: `hippius` tries Hippius SN75 first (Bittensor decentralized, recommended). `aws_s3` reverses the order. |
 | `EMA_ALPHA` | 0.1 | EMA smoothing factor (higher = more weight on recent scores) |
 | `EMA_DECAY_FACTOR` | 0.95 | EMA decay multiplier applied per missed round |
-| `SCORING_THREADS` | 4 | Fixed thread count for reproducible scoring |
-| `SCORING_MEMORY_GB` | 8 | Fixed memory (GB) for scoring Docker containers |
+| `SCORING_THREADS` | auto | Override: threads per scoring Docker job. Auto-tuned from cores (clamped 2–8) |
+| `SCORING_MEMORY_GB` | 16 | Override: memory per scoring Docker job. **Below 16 OOM-crashes DeepVariant** |
+| `MINOS_VALIDATOR_CONCURRENCY` | auto | Override: concurrent miner jobs. Auto = `min(cores//threads, ram_gb//16, 8)` |
 
 ## The Complete Cycle
 

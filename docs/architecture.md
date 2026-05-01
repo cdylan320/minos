@@ -109,18 +109,13 @@ while True:
         submissions = get_submissions(round)    # miner configs + presigned BAM/truth URLs
         download_bam_and_truth(round)           # cached; skipped if SHA256 matches
 
-        # Score primary miners first (no deadline pressure)
-        for miner in assignment.primary:
-            vcf = run_tool(miner.tool_config)
-            metrics = score_with_happy(vcf, truth_vcf)
-            score = compute_advanced_score(metrics)
-            update_ema(miner.hotkey, score)
-
-        # Score secondary miners until 3 min before deadline
-        for miner in assignment.secondary:
-            if approaching_deadline():
-                break
-            # same scoring as above
+        # Per-job thread/memory and total concurrency are auto-tuned from
+        # host CPU/RAM (see auto_scoring_config). Primaries run as a barrier;
+        # secondaries are skipped if they'd start within 3 min of the deadline.
+        with bounded_concurrency(N=auto):
+            score_in_parallel(assignment.primary)
+            if not approaching_deadline():
+                score_in_parallel(assignment.secondary)
 
         # After scoring window closes: fetch peer scores for gap miners
         backfill = get_backfill_scores(round)   # commit-then-reveal
@@ -131,7 +126,9 @@ while True:
     sleep(query_interval)
 ```
 
-If the platform does not support assignments (e.g. single-validator testnet), the validator falls back to scoring all miners sequentially — identical to the pre-subset behavior.
+Each `score_in_parallel(miners)` runs each miner's tool in its own Docker container concurrently (bounded by the auto-tuned semaphore), then scores the resulting VCF with hap.py and updates the EMA.
+
+If the platform does not support assignments (e.g. single-validator testnet), the validator scores all miners concurrently in a single batch.
 
 ### 5.1 Scoring formula
 
@@ -195,8 +192,7 @@ minos_subnet/
 │   ├── file_utils.py      # SHA256-verified file download + caching
 │   └── README.md          # Utils documentation
 ├── base/
-│   ├── genomics_config.py # Central config (Docker images, timeouts, EMA params)
-│   └── s3_manifest.json   # Reference data paths (local + S3)
+│   └── genomics_config.py # Central config (Docker images, timeouts, EMA params)
 ├── configs/
 │   ├── gatk.conf          # Miner-tunable GATK quality parameters
 │   ├── deepvariant.conf   # Miner-tunable DeepVariant parameters
