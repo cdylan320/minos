@@ -463,8 +463,13 @@ class Validator:
             if already_scored:
                 print(f"   Restart recovery: {len(already_scored)} miners already scored, skipping", flush=True)
                 for hotkey, score_info in already_scored.items():
-                    combined_final = score_info.get("combined_final", 0.0)
-                    self.score_tracker.update(hotkey, combined_final if combined_final is not None else 0.0)
+                    combined_final = score_info.get("combined_final")
+                    if combined_final is None:
+                        bt.logging.warning(
+                            f"Skipping restored score for {hotkey[:16]}...: missing AdvancedScorer combined_final"
+                        )
+                        continue
+                    self.score_tracker.update(hotkey, combined_final)
                     scored_hotkeys.append(hotkey)
                     bt.logging.info(f"Restored score for {hotkey[:16]}...: combined_final={combined_final}")
 
@@ -905,7 +910,12 @@ class Validator:
                 # --- Step 3: Feed backfill into ScoreTracker ---
                 for entry in backfill_scores:
                     hk = entry.get("miner_hotkey")
-                    combined_final = entry.get("combined_final", 0.0)
+                    combined_final = entry.get("combined_final")
+                    if combined_final is None:
+                        bt.logging.warning(
+                            f"Skipping backfill for {hk[:16] if hk else '?'}...: missing AdvancedScorer combined_final"
+                        )
+                        continue
                     if hk and hk not in set(all_scored_hotkeys):
                         self.score_tracker.update(hk, combined_final)
                         all_scored_hotkeys.append(hk)
