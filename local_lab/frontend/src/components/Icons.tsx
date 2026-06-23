@@ -101,3 +101,11 @@ export function IconResults() {
     </svg>
   );
 }
+
+export function IconLeaderboard() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden>
+      <path d="M3 15V9M7 15V3M11 15V7M15 15V5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
+  );
+}

@@ -27,6 +27,8 @@ from typing import List, Optional, Any, Callable
 BASE_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
+from utils.file_utils import USER_AGENT
+
 try:
     from dotenv import load_dotenv
     load_dotenv(BASE_DIR / ".env.miner")
@@ -343,6 +345,7 @@ def check_s3_access() -> Check:
     """
     try:
         req = urllib.request.Request(REF_HEALTH_URL, method="GET")
+        req.add_header("User-Agent", USER_AGENT)
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status == 200:
                 return Check("Reference data access", Status.PASS, "reachable", "network")

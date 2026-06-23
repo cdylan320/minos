@@ -25,6 +25,14 @@ from local_lab.backend.services.health_service import (
     get_platform_round_status,
 )
 from local_lab.backend.services.run_service import run_manager
+from local_lab.backend.services.leaderboard_service import (
+    compute_analytics,
+    get_leaderboard,
+    get_miner_history,
+    get_network_status,
+    list_rounds,
+    sync_all_finalized,
+)
 from local_lab.backend.services.vcf_service import find_latest_vcf, summarize_vcf
 
 app = FastAPI(
@@ -160,6 +168,62 @@ def api_latest_results():
         return {"found": True, **summary}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+# --- Leaderboard / analytics (public platform API) ---
+
+@app.get("/api/leaderboard/rounds")
+def api_leaderboard_rounds(limit: int = 100):
+    try:
+        return list_rounds(limit=limit)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/leaderboard")
+def api_leaderboard(round_id: str | None = None, mode: str = "latest"):
+    try:
+        return get_leaderboard(round_id=round_id, mode=mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/leaderboard/sync")
+def api_leaderboard_sync(force: bool = False, max_rounds: int = 50):
+    try:
+        return sync_all_finalized(force=force, max_rounds=max_rounds)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/leaderboard/analytics")
+def api_leaderboard_analytics(sync: bool = False):
+    try:
+        return compute_analytics(force_sync=sync)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/leaderboard/miner/{hotkey}")
+def api_leaderboard_miner(hotkey: str):
+    try:
+        return get_miner_history(hotkey)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/leaderboard/my-hotkey")
+def api_leaderboard_my_hotkey():
+    from local_lab.backend.services.leaderboard_service import get_my_hotkey
+    hk = get_my_hotkey()
+    return {"hotkey": hk, "configured": hk is not None}
+def api_leaderboard_status():
+    try:
+        return get_network_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 # Serve built frontend when available

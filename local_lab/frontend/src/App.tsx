@@ -10,11 +10,13 @@ import {
   IconConfig,
   IconDna,
   IconExternal,
+  IconLeaderboard,
   IconOverview,
   IconPlay,
   IconRefresh,
   IconResults,
 } from "./components/Icons";
+import { LeaderboardPanel } from "./components/LeaderboardPanel";
 import {
   Button,
   PipelineStepper,
@@ -24,13 +26,14 @@ import {
   TemplateSelect,
 } from "./components/UI";
 
-type Tab = "overview" | "config" | "run" | "results";
+type Tab = "overview" | "config" | "run" | "results" | "leaderboard";
 
 const NAV: { id: Tab; label: string; desc: string; icon: ReactNode }[] = [
   { id: "overview", label: "Overview", desc: "System health & setup", icon: <IconOverview /> },
   { id: "config", label: "Configuration", desc: "Tool parameters", icon: <IconConfig /> },
   { id: "run", label: "Demo Run", desc: "Live pipeline test", icon: <IconPlay /> },
   { id: "results", label: "Results", desc: "VCF output", icon: <IconResults /> },
+  { id: "leaderboard", label: "Leaderboard", desc: "Rankings & analytics", icon: <IconLeaderboard /> },
 ];
 
 function groupChecks(checks: HealthReport["checks"]) {
@@ -394,6 +397,8 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {tab === "leaderboard" && <LeaderboardPanel />}
 
         {tab === "results" && (
           <div className="card">

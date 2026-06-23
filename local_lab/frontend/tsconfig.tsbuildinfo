@@ -1,1 +1,1 @@
-{"root":["./src/App.tsx","./src/main.tsx","./src/api/client.ts","./src/components/Icons.tsx","./src/components/UI.tsx"],"version":"5.9.3"}
+{"root":["./src/App.tsx","./src/main.tsx","./src/api/client.ts","./src/components/Icons.tsx","./src/components/LeaderboardPanel.tsx","./src/components/UI.tsx"],"version":"5.9.3"}

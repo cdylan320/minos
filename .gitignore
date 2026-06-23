@@ -63,6 +63,7 @@ datasets/**/*.sdf/
 
 # Local lab
 local_lab/.runs/
+local_lab/.cache/
 local_lab/frontend/node_modules/
 local_lab/frontend/dist/
 
