@@ -33,6 +33,7 @@ from local_lab.backend.services.leaderboard_service import (
     list_rounds,
     sync_all_finalized,
 )
+from local_lab.backend.services.tune_service import apply_tune_recommendations, run_tune_pipeline
 from local_lab.backend.services.vcf_service import find_latest_vcf, summarize_vcf
 
 app = FastAPI(
@@ -56,6 +57,11 @@ class ConfigSaveRequest(BaseModel):
 
 class DemoStartRequest(BaseModel):
     template: str = Field(default="gatk", pattern="^(gatk|deepvariant|bcftools)$")
+
+
+class TuneApplyRequest(BaseModel):
+    template: str = Field(default="gatk", pattern="^(gatk|deepvariant|bcftools)$")
+    recommendations: list[dict] = Field(default_factory=list)
 
 
 @app.get("/api/meta")
@@ -216,9 +222,32 @@ def api_leaderboard_miner(hotkey: str):
 
 @app.get("/api/leaderboard/my-hotkey")
 def api_leaderboard_my_hotkey():
-    from local_lab.backend.services.leaderboard_service import get_my_hotkey
+    from local_lab.backend.services.leaderboard_service import get_my_coldkey, get_my_hotkey
     hk = get_my_hotkey()
-    return {"hotkey": hk, "configured": hk is not None}
+    return {"hotkey": hk, "coldkey": get_my_coldkey(), "configured": hk is not None}
+
+
+@app.get("/api/tune/analyze")
+def api_tune_analyze(
+    template: str = "gatk",
+    rounds: int = 30,
+    sync: bool = False,
+):
+    try:
+        return run_tune_pipeline(template=template, rounds_limit=rounds, force_sync=sync)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/tune/apply")
+def api_tune_apply(body: TuneApplyRequest):
+    try:
+        return apply_tune_recommendations(body.template, body.recommendations)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/leaderboard/status")
 def api_leaderboard_status():
     try:
         return get_network_status()

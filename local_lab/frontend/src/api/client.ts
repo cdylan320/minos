@@ -80,9 +80,26 @@ export type WinnerRow = {
   rounds_participated: number;
 };
 
+export type ColdkeyWinnerRow = {
+  coldkey: string;
+  short_coldkey: string;
+  hotkey_count: number;
+  uids: number[];
+  hotkeys: WinnerRow[];
+  wins: number;
+  win_rate?: number;
+  podium_count: number;
+  avg_score?: number;
+  rounds_participated: number;
+};
+
 export type LeaderboardAnalytics = {
   rounds_analyzed: number;
+  coldkey_mapping_available: boolean;
+  unmapped_hotkey_count: number;
+  unique_coldkeys: number;
   winner_leaderboard: WinnerRow[];
+  coldkey_winner_leaderboard: ColdkeyWinnerRow[];
   avg_score_leaderboard: Array<{
     hotkey: string;
     short_hotkey: string;
@@ -97,11 +114,129 @@ export type LeaderboardAnalytics = {
     region: string;
     hotkey: string;
     short_hotkey: string;
+    coldkey?: string | null;
+    short_coldkey?: string | null;
     uid?: number;
     score?: number;
   }>;
   tool_distribution: Record<string, number>;
   unique_miners: number;
+};
+
+export type TuneLogEntry = {
+  ts: string;
+  phase: string;
+  level: string;
+  message: string;
+  data: Record<string, unknown>;
+};
+
+export type TuneRecommendation = {
+  id: string;
+  param: string;
+  current_value: unknown;
+  proposed_value: unknown;
+  reason: string;
+  priority: number;
+  source: string;
+  selected?: boolean;
+};
+
+export type TunePipelineResult = {
+  template: string;
+  rounds_analyzed: number;
+  generated_at: string;
+  my_hotkey: string | null;
+  config_flow: {
+    real_time_on_chain: boolean;
+    summary: string;
+    steps: string[];
+    restart_required_for: string[];
+    no_restart_for: string[];
+  };
+  limitations: {
+    other_miner_configs: string;
+    haplotype_detail: string;
+    region_specific_configs: string;
+  };
+  current_config: { content: string; params: Record<string, unknown> };
+  region_analysis: {
+    recent_rounds: Array<{ round_id: string; region: string; chrom: string; width_mb?: number }>;
+    chromosome_frequency: Array<{ chrom: string; count: number }>;
+    typical_window_mb: number;
+  };
+  top_miner_analysis: {
+    summary: {
+      median_combined?: number;
+      median_snp?: number;
+      median_indel?: number;
+      tool_win_counts: Record<string, number>;
+    };
+    tool_win_counts: Record<string, number>;
+    recent_winners: Array<{
+      round_id: string;
+      round_label: string;
+      region: string;
+      hotkey: string;
+      short_hotkey: string;
+      coldkey?: string | null;
+      short_coldkey?: string | null;
+      uid?: number;
+      combined_final?: number;
+      snp_final?: number;
+      indel_final?: number;
+      tool_name?: string;
+    }>;
+  };
+  my_performance: {
+    short_hotkey: string;
+    scored_rounds: number;
+    latest_round?: {
+      round_id: string;
+      round_label?: string;
+      region: string;
+      combined_final?: number;
+      snp_final?: number;
+      indel_final?: number;
+    } | null;
+    avg_combined?: number;
+    avg_snp?: number;
+    avg_indel?: number;
+    history: Array<{
+      round_id: string;
+      region: string;
+      rank?: number;
+      combined_final?: number;
+      snp_final?: number;
+      indel_final?: number;
+      tool_name?: string;
+    }>;
+  } | null;
+  diagnosis: {
+    available: boolean;
+    score_note?: string;
+    interpretation: string;
+    gaps: Record<string, { value: number; severity: string }>;
+    latest_round?: {
+      round_id?: string;
+      round_label?: string;
+      region?: string;
+      my_combined?: number;
+      my_snp?: number;
+      my_indel?: number;
+      winner_hotkey?: string | null;
+      gaps: Record<string, { value: number; severity: string }>;
+    } | null;
+    average?: {
+      my_combined?: number;
+      my_snp?: number;
+      my_indel?: number;
+      gaps: Record<string, { value: number; severity: string }>;
+    };
+  };
+  recommendations: TuneRecommendation[];
+  proposed_config: { content: string; changed_params: string[]; diff_summary: string[] };
+  logs: TuneLogEntry[];
 };
 
 export type VcfSummary = {
@@ -175,7 +310,15 @@ export const api = {
       tool_name?: string;
     }>;
   }>(`/leaderboard/miner/${encodeURIComponent(hotkey)}`),
-  myHotkey: () => fetchJson<{ hotkey: string | null; configured: boolean }>("/leaderboard/my-hotkey"),
+  myHotkey: () => fetchJson<{ hotkey: string | null; coldkey: string | null; configured: boolean }>("/leaderboard/my-hotkey"),
+  tuneAnalyze: (template: string, rounds = 30, sync = false) =>
+    fetchJson<TunePipelineResult>(`/tune/analyze?template=${template}&rounds=${rounds}&sync=${sync}`),
+  tuneApply: (template: string, recommendations: TuneRecommendation[]) =>
+    fetchJson<{ message: string; changed_params: string[]; content: string }>("/tune/apply", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ template, recommendations }),
+    }),
 };
 
 export function streamLogs(runId: string, onLine: (line: string) => void, onDone: () => void) {

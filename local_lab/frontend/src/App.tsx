@@ -15,8 +15,10 @@ import {
   IconPlay,
   IconRefresh,
   IconResults,
+  IconTune,
 } from "./components/Icons";
 import { LeaderboardPanel } from "./components/LeaderboardPanel";
+import { TunePanel } from "./components/TunePanel";
 import {
   Button,
   PipelineStepper,
@@ -26,11 +28,12 @@ import {
   TemplateSelect,
 } from "./components/UI";
 
-type Tab = "overview" | "config" | "run" | "results" | "leaderboard";
+type Tab = "overview" | "config" | "tune" | "run" | "results" | "leaderboard";
 
 const NAV: { id: Tab; label: string; desc: string; icon: ReactNode }[] = [
   { id: "overview", label: "Overview", desc: "System health & setup", icon: <IconOverview /> },
   { id: "config", label: "Configuration", desc: "Tool parameters", icon: <IconConfig /> },
+  { id: "tune", label: "Tune Pipeline", desc: "Score-driven tuning", icon: <IconTune /> },
   { id: "run", label: "Demo Run", desc: "Live pipeline test", icon: <IconPlay /> },
   { id: "results", label: "Results", desc: "VCF output", icon: <IconResults /> },
   { id: "leaderboard", label: "Leaderboard", desc: "Rankings & analytics", icon: <IconLeaderboard /> },
@@ -329,7 +332,7 @@ export default function App() {
             <div className="card__header">
               <div>
                 <h2>Tool configuration</h2>
-                <p className="card__desc">configs/{template}.conf — submitted to validators in live rounds</p>
+                <p className="card__desc">configs/{template}.conf — picked up by live miner on the <strong>next open round</strong> (not instant on-chain)</p>
               </div>
               <div className="btn-group">
                 <Button variant="secondary" onClick={() => loadConfig(template)}>Reload</Button>
@@ -339,6 +342,10 @@ export default function App() {
               </div>
             </div>
             {configMsg && <div className="toast toast--info">{configMsg}</div>}
+            <p className="tune-inline-note">
+              Saving here writes to disk immediately. Your pm2 miner re-reads this file when the next round opens (~30s poll).
+              Use <button type="button" className="link-btn" onClick={() => setTab("tune")}>Tune Pipeline</button> for score-based recommendations.
+            </p>
             <div className="editor-wrap">
               <div className="editor-wrap__bar">
                 <span className="editor-wrap__dot editor-wrap__dot--r" />
@@ -357,6 +364,14 @@ export default function App() {
               />
             </div>
           </div>
+        )}
+
+        {tab === "tune" && (
+          <TunePanel
+            template={template}
+            onConfigApplied={() => loadConfig(template)}
+            onRunDemo={() => { setTab("run"); startDemo(); }}
+          />
         )}
 
         {tab === "run" && (

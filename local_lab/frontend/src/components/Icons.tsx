@@ -109,3 +109,13 @@ export function IconLeaderboard() {
     </svg>
   );
 }
+
+export function IconTune() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden>
+      <path d="M3 6h12M6 3v6M12 9v6M3 12h12" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="6" cy="6" r="2" stroke="currentColor" strokeWidth="1.4" />
+      <circle cx="12" cy="12" r="2" stroke="currentColor" strokeWidth="1.4" />
+    </svg>
+  );
+}

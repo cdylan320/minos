@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, type LeaderboardAnalytics, type LeaderboardData, type RoundInfo } from "../api/client";
 import { Button } from "./UI";
 
 type LbView = "ranking" | "analytics" | "miner";
+type AnalyticsGroup = "hotkey" | "coldkey";
 
 function shortHotkey(hk: string) {
   return hk.length > 16 ? `${hk.slice(0, 6)}...${hk.slice(-4)}` : hk;
@@ -35,6 +36,9 @@ export function LeaderboardPanel() {
   const [leaderboard, setLeaderboard] = useState<LeaderboardData | null>(null);
   const [analytics, setAnalytics] = useState<LeaderboardAnalytics | null>(null);
   const [myHotkey, setMyHotkey] = useState<string | null>(null);
+  const [myColdkey, setMyColdkey] = useState<string | null>(null);
+  const [analyticsGroup, setAnalyticsGroup] = useState<AnalyticsGroup>("hotkey");
+  const [expandedColdkey, setExpandedColdkey] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [minerQuery, setMinerQuery] = useState("");
   const [minerHistory, setMinerHistory] = useState<Awaited<ReturnType<typeof api.minerHistory>> | null>(null);
@@ -89,6 +93,7 @@ export function LeaderboardPanel() {
       try {
         const [_, my] = await Promise.all([loadRounds(), api.myHotkey()]);
         setMyHotkey(my.hotkey);
+        setMyColdkey(my.coldkey);
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -286,12 +291,44 @@ export function LeaderboardPanel() {
         <div className="page-grid page-grid--analytics">
           <div className="card">
             <div className="card__header">
-              <h2>Wins leaderboard (#1 count)</h2>
-              <span className="card__meta">{analytics?.rounds_analyzed ?? 0} rounds analyzed</span>
+              <div className="lb-analytics-header">
+                <h2>Wins leaderboard (#1 count)</h2>
+                <div className="lb-mode" role="tablist" aria-label="Group analytics by">
+                  <button
+                    type="button"
+                    className={`lb-mode__btn ${analyticsGroup === "hotkey" ? "lb-mode__btn--active" : ""}`}
+                    onClick={() => {
+                      setAnalyticsGroup("hotkey");
+                      setExpandedColdkey(null);
+                    }}
+                  >
+                    By hotkey
+                  </button>
+                  <button
+                    type="button"
+                    className={`lb-mode__btn ${analyticsGroup === "coldkey" ? "lb-mode__btn--active" : ""}`}
+                    onClick={() => setAnalyticsGroup("coldkey")}
+                  >
+                    By coldkey
+                  </button>
+                </div>
+              </div>
+              <span className="card__meta">
+                {analytics?.rounds_analyzed ?? 0} rounds analyzed
+                {analyticsGroup === "coldkey" && analytics?.unique_coldkeys != null
+                  ? ` · ${analytics.unique_coldkeys} coldkeys`
+                  : ""}
+              </span>
             </div>
+            {analyticsGroup === "coldkey" && analytics && analytics.unmapped_hotkey_count > 0 && (
+              <p className="lb-source">
+                {analytics.unmapped_hotkey_count} hotkey(s) could not be mapped to a coldkey
+                (deregistered or not on SN107). Those rounds are excluded from coldkey totals.
+              </p>
+            )}
             {loading && !analytics ? (
               <div className="empty-state">Computing analytics…</div>
-            ) : (
+            ) : analyticsGroup === "hotkey" ? (
               <div className="table-wrap">
                 <table className="data-table lb-table">
                   <thead>
@@ -322,6 +359,109 @@ export function LeaderboardPanel() {
                   </tbody>
                 </table>
               </div>
+            ) : (
+              <div className="table-wrap">
+                <table className="data-table lb-table">
+                  <thead>
+                    <tr>
+                      <th>#</th>
+                      <th>Coldkey</th>
+                      <th>Hotkeys</th>
+                      <th>UIDs</th>
+                      <th>Wins</th>
+                      <th>Win rate</th>
+                      <th>Podiums</th>
+                      <th>Avg score</th>
+                      <th>Rounds</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {analytics?.coldkey_winner_leaderboard.map((w, i) => {
+                      const expanded = expandedColdkey === w.coldkey;
+                      const clickable = w.hotkeys.length > 0;
+                      return (
+                        <Fragment key={w.coldkey}>
+                          <tr
+                            className={[
+                              w.coldkey === myColdkey ? "lb-row--mine" : "",
+                              clickable ? "lb-row--clickable" : "",
+                              expanded ? "lb-row--expanded" : "",
+                            ].filter(Boolean).join(" ")}
+                            onClick={() => {
+                              if (!clickable) return;
+                              setExpandedColdkey(expanded ? null : w.coldkey);
+                            }}
+                            title={clickable ? "Click to show hotkeys" : undefined}
+                          >
+                            <td>{i + 1}</td>
+                            <td>
+                              <code>{w.short_coldkey}</code>
+                              {clickable && (
+                                <span className={`lb-expand-icon ${expanded ? "lb-expand-icon--open" : ""}`} aria-hidden>
+                                  ▸
+                                </span>
+                              )}
+                            </td>
+                            <td>{w.hotkey_count}</td>
+                            <td>{w.uids.length ? w.uids.join(", ") : "—"}</td>
+                            <td><strong>{w.wins}</strong></td>
+                            <td>{w.win_rate != null ? `${(w.win_rate * 100).toFixed(1)}%` : "—"}</td>
+                            <td>{w.podium_count}</td>
+                            <td>{w.avg_score?.toFixed(4) ?? "—"}</td>
+                            <td>{w.rounds_participated}</td>
+                          </tr>
+                          {expanded && (
+                            <tr className="lb-row-detail">
+                              <td colSpan={9}>
+                                <div className="lb-coldkey-detail">
+                                  <div className="lb-coldkey-detail__header">
+                                    <strong>Hotkeys under {w.short_coldkey}</strong>
+                                    <span className="lb-coldkey-detail__full" title={w.coldkey}>{w.coldkey}</span>
+                                  </div>
+                                  <table className="data-table lb-table lb-table--nested">
+                                    <thead>
+                                      <tr>
+                                        <th>Hotkey</th>
+                                        <th>UID</th>
+                                        <th>Wins</th>
+                                        <th>Win rate</th>
+                                        <th>Podiums</th>
+                                        <th>Avg score</th>
+                                        <th>Rounds</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {w.hotkeys.map((hk) => (
+                                        <tr
+                                          key={hk.hotkey}
+                                          className={hk.hotkey === myHotkey ? "lb-row--mine" : ""}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            lookupMiner(hk.hotkey);
+                                          }}
+                                          title="Click for miner history"
+                                        >
+                                          <td><code>{hk.short_hotkey}</code></td>
+                                          <td>{hk.uid ?? "—"}</td>
+                                          <td><strong>{hk.wins}</strong></td>
+                                          <td>{hk.win_rate != null ? `${(hk.win_rate * 100).toFixed(1)}%` : "—"}</td>
+                                          <td>{hk.podium_count}</td>
+                                          <td>{hk.avg_score?.toFixed(4) ?? "—"}</td>
+                                          <td>{hk.rounds_participated}</td>
+                                        </tr>
+                                      ))}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
 
@@ -333,7 +473,9 @@ export function LeaderboardPanel() {
               {analytics?.round_winners.map((w) => (
                 <div key={w.round_id} className="lb-timeline__item">
                   <span className="lb-timeline__when">{formatRoundLabel(w.round_id)}</span>
-                  <code className="lb-timeline__hk">{w.short_hotkey}</code>
+                  <code className="lb-timeline__hk">
+                    {analyticsGroup === "coldkey" && w.short_coldkey ? w.short_coldkey : w.short_hotkey}
+                  </code>
                   <span className="lb-timeline__score">{(w.score ?? 0).toFixed(4)}</span>
                   <span className="lb-timeline__region">{w.region}</span>
                 </div>
