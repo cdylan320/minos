@@ -531,6 +531,7 @@ btcli subnet metagraph --netuid 107
 - [docs/hap_py_docker.md](docs/hap_py_docker.md) - hap.py Docker image reference
 - [scripts/verify.sh](scripts/verify.sh) - Pre-flight environment check (`bash scripts/verify.sh --miner`)
 - [scripts/demo.sh](scripts/demo.sh) - Run a single demo round end-to-end (`bash scripts/demo.sh`)
+- [local_lab/README.md](local_lab/README.md) - **Local Lab** — web UI + API for miner testing (`bash local_lab/start-lab.sh`)
 
 ---
 

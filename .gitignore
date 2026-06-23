@@ -61,6 +61,11 @@ datasets/**/*.fai
 datasets/**/*.dict
 datasets/**/*.sdf/
 
+# Local lab
+local_lab/.runs/
+local_lab/frontend/node_modules/
+local_lab/frontend/dist/
+
 # Output files
 output/
 *.tmp

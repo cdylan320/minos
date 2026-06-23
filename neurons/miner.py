@@ -192,6 +192,12 @@ class Miner:
     @staticmethod
     def get_config():
         """Get configuration from argparse and environment."""
+        # bt.config() only keeps bittensor-registered args — custom flags like
+        # --demo are silently dropped. Pre-parse them so demo mode actually works.
+        pre_parser = argparse.ArgumentParser(add_help=False)
+        pre_parser.add_argument("--demo", action="store_true", default=False)
+        pre_args, _ = pre_parser.parse_known_args()
+
         parser = argparse.ArgumentParser(description="Minos Miner", allow_abbrev=False)
 
         parser.add_argument("--netuid", type=int, default=int(os.getenv("NETUID", 107)), help="Subnet UID")
@@ -219,6 +225,9 @@ class Miner:
         bt.wallet.add_args(parser)
 
         config = bt.config(parser)
+
+        # Restore custom flags stripped by bt.config()
+        config.demo = bool(pre_args.demo)
 
         # Env overrides
         if os.getenv("NETWORK"):

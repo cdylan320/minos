@@ -342,7 +342,7 @@ if [ "$FLAG_DEMO" = true ] || [ "$MINER_DEMO_FLAG" = true ]; then
     echo -e "${YELLOW}  - no wallet required, no chain connection${NC}"
     echo -e "${YELLOW}  - routes to platform /v2/demo/* sandbox${NC}"
     echo -e "${YELLOW}  - submissions are accepted but not scored, no TAO earned${NC}"
-    python -m neurons.miner --demo
+    MINER_DEMO=true python -m neurons.miner --demo
 else
     echo -e "${GREEN}Starting Minos Miner (${MINER_TEMPLATE:-gatk})...${NC}"
     python -m neurons.miner \
