@@ -229,10 +229,21 @@ def _analyze_top_miners(
     }
 
 
+def parse_date(date_str: str) -> datetime:
+    if not date_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    cleaned = date_str.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
 def _analyze_my_performance(
     hotkey: Optional[str],
     leaderboards: List[Dict[str, Any]],
     logs: List[Dict[str, Any]],
+    template: str,
 ) -> Optional[Dict[str, Any]]:
     if not hotkey:
         _log(logs, "my_miner", "warn", "No local hotkey configured in .env — skipping personal diagnosis")
@@ -253,11 +264,36 @@ def _analyze_my_performance(
                 "indel_final": e.get("indel_final"),
                 "tool_name": e.get("tool_name"),
                 "status": e.get("status"),
+                "submitted_at": e.get("submitted_at") or rnd.get("round_id"),
             })
 
     if not rows:
         _log(logs, "my_miner", "warn", f"Hotkey {_short_hotkey(hotkey)} not found in cached round history")
         return {"hotkey": hotkey, "short_hotkey": _short_hotkey(hotkey), "rounds_found": 0, "history": []}
+
+    # Load config history for this template
+    from local_lab.backend.services.config_service import read_config_history
+    cfg_history = [c for c in read_config_history() if c.get("template") == template]
+
+    # Map each config change to the first round submitted/run after it
+    round_updates: Dict[str, List[Dict[str, Any]]] = {}
+    chronological_rounds = sorted(rows, key=lambda x: parse_date(x.get("submitted_at") or x.get("round_id")))
+
+    for c in cfg_history:
+        t_c = parse_date(c.get("timestamp"))
+        target_round = None
+        for r in chronological_rounds:
+            t_r = parse_date(r.get("submitted_at") or r.get("round_id"))
+            if t_r > t_c:
+                target_round = r
+                break
+        if target_round:
+            rid = target_round["round_id"]
+            round_updates.setdefault(rid, []).append(c)
+
+    for r in rows:
+        rid = r["round_id"]
+        r["updates"] = round_updates.get(rid, [])
 
     scored = [r for r in rows if r.get("combined_final") is not None]
     history = sorted(rows, key=lambda x: x.get("round_id", ""), reverse=True)
@@ -291,6 +327,81 @@ def _analyze_my_performance(
         "best_combined": max((r["combined_final"] for r in scored), default=None),
         "worst_combined": min((r["combined_final"] for r in scored), default=None),
         "history": history[:20],
+    }
+
+
+def _analyze_last_updates(
+    my_perf: Optional[Dict[str, Any]],
+    logs: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if not my_perf or not my_perf.get("history"):
+        return None
+
+    history = my_perf["history"]
+    rounds_with_updates = [r for r in history if r.get("updates")]
+
+    if not rounds_with_updates:
+        _log(logs, "tune_logic", "info", "No previous Local Lab config updates found in analyzed round range")
+        return None
+
+    r_updated = rounds_with_updates[0]
+    rid = r_updated["round_id"]
+
+    history_chrono = sorted(history, key=lambda x: parse_date(x.get("submitted_at") or x.get("round_id")))
+    idx = -1
+    for i, r in enumerate(history_chrono):
+        if r["round_id"] == rid:
+            idx = i
+            break
+
+    if idx <= 0:
+        _log(logs, "tune_logic", "info", f"Found config update in round {_format_round_short(rid)}, but no previous round to compare against")
+        return None
+
+    r_prev = history_chrono[idx - 1]
+
+    score_now = r_updated.get("combined_final")
+    score_prev = r_prev.get("combined_final")
+
+    if score_now is None or score_prev is None:
+        return None
+
+    diff = score_now - score_prev
+    updates_desc = []
+    for u in r_updated["updates"]:
+        for ch in u.get("changes", []):
+            updates_desc.append(f"{ch['param']} ({ch['old_value']} -> {ch['new_value']})")
+
+    updates_str = ", ".join(updates_desc)
+
+    analysis_msg = ""
+    if diff > 0.01:
+        analysis_msg = (
+            f"Your last configuration update ({updates_str}) in round {_format_round_short(rid)} "
+            f"saw your score IMPROVE by {diff:+.4f} (from {score_prev:.4f} to {score_now:.4f}). This change is performing well!"
+        )
+        _log(logs, "tune_logic", "success", analysis_msg)
+    elif diff < -0.01:
+        analysis_msg = (
+            f"Your last configuration update ({updates_str}) in round {_format_round_short(rid)} "
+            f"saw your score DECREASE by {diff:.4f} (from {score_prev:.4f} to {score_now:.4f}). Consider reverting or adjusting further."
+        )
+        _log(logs, "tune_logic", "warn", analysis_msg)
+    else:
+        analysis_msg = (
+            f"Your last configuration update ({updates_str}) in round {_format_round_short(rid)} "
+            f"kept your score stable (change of {diff:+.4f}, from {score_prev:.4f} to {score_now:.4f})."
+        )
+        _log(logs, "tune_logic", "info", analysis_msg)
+
+    return {
+        "round_id": rid,
+        "round_label": _format_round_short(rid),
+        "score_before": score_prev,
+        "score_after": score_now,
+        "difference": diff,
+        "message": analysis_msg,
+        "updates": r_updated["updates"]
     }
 
 
@@ -457,76 +568,237 @@ def _build_recommendations(
             "selected": True,
         })
 
+    # Fetch and evaluate quality gaps to customize recommendations dynamically
+    gaps = diagnosis.get("gaps", {})
+    combined_gap = float(gaps.get("combined", {}).get("value", 0.0) or 0.0)
+    snp_gap = float(gaps.get("snp", {}).get("value", 0.0) or 0.0)
+    indel_gap = float(gaps.get("indel", {}).get("value", 0.0) or 0.0)
+
+    _log(
+        logs, "recommendations_engine", "info",
+        f"Evaluating score gaps vs top miners: Combined={combined_gap:+.4f}, SNP={snp_gap:+.4f}, INDEL={indel_gap:+.4f}"
+    )
+
     if template == "gatk":
+        # PCR indel model is always NONE for PCR-free benchmark BAMs
         if current.get("pcr_indel_model") != "NONE":
             add(
                 "pcr_indel_model", "NONE",
-                "GIAB/Minos BAMs are PCR-free — CONSERVATIVE PCR model suppresses real indels.",
+                "GIAB and Minos BAMs are PCR-free — setting pcr_indel_model to NONE eliminates unnecessary conservative filtering and restores critical variant recall.",
                 1, "tuning_guide",
             )
 
-        weakness = diagnosis.get("primary_weakness", "none")
-        if diagnosis.get("latest_round"):
-            weakness = diagnosis["latest_round"].get("primary_weakness", weakness)
+        # 1. Calling confidence threshold (standard_min_confidence_threshold_for_calling)
         conf = float(current.get("standard_min_confidence_threshold_for_calling", 30))
-        base_q = int(current.get("min_base_quality_score", 10))
-        map_q = int(current.get("min_mapping_quality_score", 20))
-
-        if weakness in ("snp", "overall") and diagnosis.get("available"):
-            if conf > 25:
+        if combined_gap > 0.15:
+            if conf > 10.0:
                 add(
-                    "standard_min_confidence_threshold_for_calling", conf - 5,
-                    f"SNP gap vs top miners — lower calling threshold to recover recall (was {conf}).",
+                    "standard_min_confidence_threshold_for_calling", 10.0,
+                    f"Your score has a massive gap of {combined_gap:.4f} vs top miners. Lowering calling threshold from {conf} to 10.0 drastically increases variant discovery sensitivity to catch up.",
                     2, "score_diagnosis",
                 )
-            if base_q > 8:
+        elif combined_gap > 0.05:
+            if conf > 15.0:
                 add(
-                    "min_base_quality_score", max(8, base_q - 2),
-                    "SNP recall may improve with slightly lower base quality filter.",
+                    "standard_min_confidence_threshold_for_calling", 15.0,
+                    f"With a gap of {combined_gap:.4f}, lowering the calling threshold from {conf} to 15.0 improves variant recall while maintaining competitive precision.",
+                    2, "score_diagnosis",
+                )
+        elif combined_gap > 0.01:
+            if conf > 20.0:
+                add(
+                    "standard_min_confidence_threshold_for_calling", 20.0,
+                    f"Lowering calling threshold slightly from {conf} to 20.0 helps recover borderline SNPs to close the {combined_gap:.4f} score gap.",
+                    2, "score_diagnosis",
+                )
+
+        # 2. Genotyping priors (heterozygosity and indel_heterozygosity)
+        snp_het = float(current.get("heterozygosity", 0.001))
+        indel_het = float(current.get("indel_heterozygosity", 0.000125))
+        if combined_gap > 0.05:
+            if snp_het < 0.003:
+                add(
+                    "heterozygosity", 0.003,
+                    f"Raising SNP heterozygosity calling prior from {snp_het} to 0.003 shifts the posterior genotype model towards variants, rescuing marginal SNPs under high-depth.",
+                    3, "score_diagnosis",
+                )
+            if indel_het < 0.0003:
+                add(
+                    "indel_heterozygosity", 0.0003,
+                    f"Increasing INDEL heterozygosity calling prior from {indel_het} to 0.0003 instructs the genotyper to keep low-likelihood indel events, significantly boosting INDEL recall.",
+                    3, "score_diagnosis",
+                )
+        elif combined_gap > 0.01:
+            if snp_het < 0.002:
+                add(
+                    "heterozygosity", 0.002,
+                    f"Slightly raising heterozygosity prior from {snp_het} to 0.002 helps GATK genotype borderline SNPs.",
+                    3, "score_diagnosis",
+                )
+            if indel_het < 0.0002:
+                add(
+                    "indel_heterozygosity", 0.0002,
+                    f"Slightly increasing indel heterozygosity prior from {indel_het} to 0.0002 improves INDEL sensitivity.",
                     3, "score_diagnosis",
                 )
 
-        if weakness in ("indel", "overall") and diagnosis.get("available"):
-            if conf > 28:
+        # 3. Assembly Graph & Branch recovery
+        recover_branches = current.get("recover_all_dangling_branches", "false")
+        if str(recover_branches).lower() == "false" and combined_gap > 0.02:
+            add(
+                "recover_all_dangling_branches", "true",
+                "Enabling recover_all_dangling_branches allows GATK to rescue assembly paths that terminate abruptly, recovering vital indels/SNPs at read boundaries.",
+                4, "assembly_opt",
+            )
+
+        min_prune = int(current.get("min_pruning", 2))
+        if min_prune > 1 and combined_gap > 0.04:
+            add(
+                "min_pruning", 1,
+                "Lowering min_pruning from 2 to 1 stops the assembly graph from pruning rare candidate paths, salvaging variants in low-coverage or highly diverse loci.",
+                4, "assembly_opt",
+            )
+
+        max_alt = int(current.get("max_alternate_alleles", 6))
+        if max_alt < 12 and combined_gap > 0.02:
+            add(
+                "max_alternate_alleles", 12,
+                "Increasing maximum alternate alleles to genotype from 6 to 12 prevents multi-allelic sites in complex benchmark windows from being skipped.",
+                4, "assembly_opt",
+            )
+
+        # 4. Filters & Reads Optimization
+        base_q = int(current.get("min_base_quality_score", 10))
+        if combined_gap > 0.10:
+            if base_q > 5:
                 add(
-                    "standard_min_confidence_threshold_for_calling", conf - 3,
-                    f"INDEL gap vs top miners — moderate confidence reduction (was {conf}).",
-                    2, "score_diagnosis",
+                    "min_base_quality_score", 5,
+                    f"With a gap of {combined_gap:.4f}, lowering base quality threshold from {base_q} to 5 rescues variant-carrying reads with borderline-quality base positions.",
+                    5, "score_diagnosis",
                 )
-            indel_het = float(current.get("indel_heterozygosity", 0.000125))
-            if indel_het < 0.0002:
+        elif combined_gap > 0.02:
+            if base_q > 7:
                 add(
-                    "indel_heterozygosity", min(0.0002, indel_het * 1.5),
-                    "Slightly higher indel prior can help indel sensitivity on GIAB windows.",
-                    4, "heuristic",
+                    "min_base_quality_score", 7,
+                    "Lowering base quality threshold slightly to 7 captures variants lying on borderline read bases.",
+                    5, "score_diagnosis",
                 )
 
-        if weakness == "none" and (top_summary.get("median_snp") or 0) > 0.98:
-            if map_q < 25:
+        map_q = int(current.get("min_mapping_quality_score", 20))
+        if combined_gap > 0.10:
+            if map_q > 12:
                 add(
-                    "min_mapping_quality_score", min(25, map_q + 5),
-                    "Top miners show very high SNP — slightly stricter mapping quality may reduce FPs without hurting recall.",
-                    5, "top_miner_profile",
+                    "min_mapping_quality_score", 12,
+                    f"Decreasing minimum mapping quality from {map_q} to 12 allows variant calling in repetitive or low-mappability regions where standard filters throw away valid alignments.",
+                    5, "score_diagnosis",
                 )
+        elif combined_gap > 0.02:
+            if map_q > 15:
+                add(
+                    "min_mapping_quality_score", 15,
+                    "Lowering minimum mapping quality to 15 helps recover variant calls in homologous and complex regions.",
+                    5, "score_diagnosis",
+                )
+
+        max_reads_pos = int(current.get("max_reads_per_alignment_start", 50))
+        if max_reads_pos < 150 and combined_gap > 0.02:
+            add(
+                "max_reads_per_alignment_start", 150,
+                "Benchmark regions suffer when reads are downsampled to 50. Raising max_reads_per_alignment_start to 150 retains deep coverage alignments, boosting genotype confidence.",
+                6, "depth_opt",
+            )
 
     elif template == "deepvariant":
         if current.get("model_type") != "WGS":
             add("model_type", "WGS", "Minos BAMs are whole-genome — WES mode hurts scores.", 1, "tuning_guide")
+
+        # Phasing & Haplotype-aware calling (HUGE scores booster)
+        sort_by_hap = current.get("sort_by_haplotypes", "false")
+        phase_reads = current.get("phase_reads", "false")
+        if str(sort_by_hap).lower() == "false" and combined_gap > 0.01:
+            add(
+                "sort_by_haplotypes", "true",
+                "DeepVariant uses CNN image classification. Enabling sort_by_haplotypes sorts aligned reads by their phased haplotype, creating clear visual structures that dramatically improve calling precision and recall.",
+                1, "tuning_guide",
+            )
+        if str(phase_reads).lower() == "false" and combined_gap > 0.01:
+            add(
+                "phase_reads", "true",
+                "Phasing reads complements haplotype-aware sorting, allowing genotype evaluation using haplotype context.",
+                1, "tuning_guide",
+            )
+
+        # Candidate variant thresholds in make_examples
+        vsc_snp = float(current.get("vsc_min_fraction_snps", 0.12))
+        vsc_indel = float(current.get("vsc_min_fraction_indels", 0.12))
+        if combined_gap > 0.04:
+            if vsc_snp > 0.05:
+                add(
+                    "vsc_min_fraction_snps", 0.05,
+                    f"Lowering make_examples SNP candidate threshold from {vsc_snp} to 0.05 ensures borderline SNPs are passed to the CNN model rather than being filtered prematurely.",
+                    2, "score_diagnosis",
+                )
+            if vsc_indel > 0.05:
+                add(
+                    "vsc_min_fraction_indels", 0.05,
+                    "Lowering INDEL candidate fraction to 0.05 ensures marginal indels are evaluated by the deep learning classifier.",
+                    2, "score_diagnosis",
+                )
+
+        # Read quality filters
         mq = int(current.get("min_mapping_quality", 5))
-        weakness = diagnosis.get("primary_weakness", "none")
-        if weakness in ("snp", "overall") and mq > 3:
-            add("min_mapping_quality", max(3, mq - 2), "Lower mapping quality filter to improve SNP recall.", 2, "score_diagnosis")
-        elif weakness == "none" and mq < 10:
-            add("min_mapping_quality", min(10, mq + 2), "Top performers run clean calls — modest MQ increase may trim FPs.", 3, "top_miner_profile")
+        bq = int(current.get("min_base_quality", 10))
+        if combined_gap > 0.05:
+            if mq > 2:
+                add("min_mapping_quality", 2, "Lowering candidate read mapping quality filter to 2 rescues alignments in homologous regions.", 3, "score_diagnosis")
+            if bq > 5:
+                add("min_base_quality", 5, "Lowering base quality threshold to 5 recovers candidate reads with minor sequencing errors.", 3, "score_diagnosis")
+
+        # Postprocessing filters
+        q_filt = float(current.get("qual_filter", 1.0))
+        if q_filt > 0.0 and combined_gap > 0.02:
+            add(
+                "qual_filter", 0.0,
+                "Setting qual_filter to 0.0 disables post-calling filters, allowing DeepVariant to output all calls to maximize recall score on the platform.",
+                4, "score_diagnosis",
+            )
 
     elif template == "bcftools":
-        mq = int(current.get("min_MQ", 0))
+        # BAQ Recalculation suppression
+        no_baq = current.get("no_BAQ", "false")
+        if str(no_baq).lower() == "false" and combined_gap > 0.01:
+            add(
+                "no_BAQ", "true",
+                "Base Alignment Quality (BAQ) recalculation can over-suppress real variants near indels, causing severe recall gaps. Setting no_BAQ=true is standard practice for high variant discovery sensitivity.",
+                1, "tuning_guide",
+            )
+
+        # Depth limits
+        max_depth = int(current.get("max_depth", 250))
+        if max_depth < 1000 and combined_gap > 0.02:
+            add(
+                "max_depth", 1000,
+                "Your bcftools max_depth is 250. This can truncate variant calling at high-depth positions in WGS benchmark datasets. Raising to 1000 maintains coverage integration.",
+                2, "score_diagnosis",
+            )
+
+        # Base/Mapping Quality filters
         bq = int(current.get("min_BQ", 13))
-        weakness = diagnosis.get("primary_weakness", "none")
-        if weakness in ("snp", "overall") and mq > 5:
-            add("min_MQ", max(0, mq - 5), "Reduce mapping quality filter for better SNP recall.", 2, "score_diagnosis")
-        if weakness in ("indel", "overall") and bq > 10:
-            add("min_BQ", max(10, bq - 3), "Lower base quality filter to help indel recall.", 3, "score_diagnosis")
+        if combined_gap > 0.04:
+            if bq > 8:
+                add("min_BQ", 8, f"Lowering min_BQ filter from {bq} to 8 captures reads with borderline base scores, closing the {combined_gap:.4f} gap.", 3, "score_diagnosis")
+        elif combined_gap > 0.01:
+            if bq > 10:
+                add("min_BQ", 10, "Slightly lowering base quality filter to 10 improves variant calling sensitivity.", 3, "score_diagnosis")
+
+        # INDEL calling priors
+        gap_frac = float(current.get("gap_frac", 0.002))
+        if gap_frac > 0.0005 and combined_gap > 0.02:
+            add(
+                "gap_frac", 0.0005,
+                "Lowering the required fraction of gapped reads to 0.0005 makes bcftools far more sensitive to rare or low-allelic fraction indels, improving INDEL scores.",
+                4, "score_diagnosis",
+            )
 
     recs.sort(key=lambda r: r["priority"])
     _log(logs, "recommendations", "success", f"Generated {len(recs)} parameter recommendation(s)", {"count": len(recs)})
@@ -627,7 +899,8 @@ def run_tune_pipeline(
     hotkey_to_coldkey = _get_hotkey_coldkey_map(force=force_sync)
     region_analysis = _analyze_regions(leaderboards, logs)
     top_analysis = _analyze_top_miners(leaderboards, hotkey_to_coldkey, logs)
-    my_perf = _analyze_my_performance(hotkey, leaderboards, logs)
+    my_perf = _analyze_my_performance(hotkey, leaderboards, logs, template)
+    last_up_analysis = _analyze_last_updates(my_perf, logs)
     diagnosis = _diagnose(my_perf, top_analysis["summary"], top_analysis["recent_winners"], logs)
     recommendations = _build_recommendations(
         template, current_params, diagnosis, top_analysis["summary"], logs,
@@ -659,6 +932,7 @@ def run_tune_pipeline(
         "top_miner_analysis": top_analysis,
         "my_performance": my_perf,
         "diagnosis": diagnosis,
+        "last_update_analysis": last_up_analysis,
         "recommendations": recommendations,
         "proposed_config": {
             "content": proposed_content,
@@ -675,7 +949,7 @@ def apply_tune_recommendations(
 ) -> Dict[str, Any]:
     content = read_config(template)["content"]
     new_content, changed = _apply_recommendations_to_content(content, recommendations)
-    write_config(template, new_content)
+    write_config(template, new_content, source="tune_recommendation")
     return {
         "template": template,
         "changed_params": changed,

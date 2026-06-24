@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, type TunePipelineResult, type TuneRecommendation } from "../api/client";
+import { api, type TunePipelineResult, type TuneRecommendation, type ConfigChangeRecord } from "../api/client";
 import { Button } from "./UI";
 
 type Props = {
@@ -43,6 +43,7 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
   const [msg, setMsg] = useState("");
   const [showLogs, setShowLogs] = useState(true);
   const logEndRef = useRef<HTMLDivElement>(null);
+  const [selectedUpdatesForModal, setSelectedUpdatesForModal] = useState<ConfigChangeRecord[] | null>(null);
 
   const runAnalysis = useCallback(async () => {
     setLoading(true);
@@ -139,6 +140,19 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
                 </p>
               ) : (
                 <div className="tune-diagnosis">
+                  {report.last_update_analysis && (
+                    <div className="tune-update-analysis">
+                      <h4>🔄 Last Update Analysis</h4>
+                      <p className="tune-update-analysis__msg">{report.last_update_analysis.message}</p>
+                      <button
+                        className="link-btn"
+                        style={{ marginTop: "0.5rem", display: "inline-flex", alignItems: "center", gap: "4px" }}
+                        onClick={() => setSelectedUpdatesForModal(report.last_update_analysis?.updates || null)}
+                      >
+                        View last update diff ({report.last_update_analysis.updates.length})
+                      </button>
+                    </div>
+                  )}
                   <p className="tune-diagnosis__text">{report.diagnosis.interpretation}</p>
                   {latest && (
                     <div className="tune-latest">
@@ -289,7 +303,7 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
                   <thead>
                     <tr>
                       <th>Round</th><th>Region</th><th>Rank</th>
-                      <th>Combined</th><th>SNP</th><th>INDEL</th><th>Tool</th>
+                      <th>Combined</th><th>SNP</th><th>INDEL</th><th>Tool</th><th>Updates</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -302,6 +316,20 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
                         <td>{h.snp_final?.toFixed(4) ?? "—"}</td>
                         <td>{h.indel_final?.toFixed(4) ?? "—"}</td>
                         <td>{h.tool_name}</td>
+                        <td>
+                          {h.updates && h.updates.length > 0 ? (
+                            <button
+                              type="button"
+                              className="link-btn tune-update-btn"
+                              onClick={() => setSelectedUpdatesForModal(h.updates || null)}
+                              title={`${h.updates.length} configuration update(s) detected before this round`}
+                            >
+                              🔄 {formatRoundId(h.updates[0].timestamp)}
+                            </button>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -383,8 +411,163 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
       )}
 
       {loading && !report && <div className="empty-state">Running tune pipeline…</div>}
+
+      {selectedUpdatesForModal && (
+        <div className="modal-backdrop" onClick={() => setSelectedUpdatesForModal(null)}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Configuration Update Details</h2>
+              <button type="button" className="modal-close" onClick={() => setSelectedUpdatesForModal(null)}>&times;</button>
+            </div>
+            <div className="modal-body">
+              {selectedUpdatesForModal.map((update, index) => {
+                const diffs = getDiffLines(update.old_content, update.new_content);
+                return (
+                  <div key={update.id} className="modal-update-record" style={{ marginBottom: index < selectedUpdatesForModal.length - 1 ? "2rem" : 0 }}>
+                    <div className="modal-update-meta">
+                      <span><strong>Template:</strong> {update.template.toUpperCase()}</span>
+                      <span><strong>Date:</strong> {new Date(update.timestamp).toLocaleString()}</span>
+                      <span><strong>Source:</strong> <span className={`source-tag source-tag--${update.source}`}>{update.source === "tune_recommendation" ? "Tune Recommendation" : "Manual Edit"}</span></span>
+                    </div>
+
+                    <h4 style={{ marginTop: "1rem", marginBottom: "0.5rem" }}>Parameter Changes</h4>
+                    <div className="table-wrap">
+                      <table className="data-table">
+                        <thead>
+                          <tr>
+                            <th>Parameter</th>
+                            <th>Type</th>
+                            <th>Old Value</th>
+                            <th>New Value</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {diffs.map((d) => (
+                            <tr key={d.param}>
+                              <td><code>{d.param}</code></td>
+                              <td>
+                                <span className={`diff-type-tag diff-type-tag--${d.type}`}>
+                                  {d.type.toUpperCase()}
+                                </span>
+                              </td>
+                              <td style={{ textDecoration: d.type === "added" ? "none" : "line-through", color: "var(--text-secondary)" }}>
+                                {d.oldVal ?? "—"}
+                              </td>
+                              <td style={{ fontWeight: "bold", color: d.type === "removed" ? "var(--text-muted)" : "var(--accent)" }}>
+                                {d.newVal ?? "—"}
+                              </td>
+                            </tr>
+                          ))}
+                          {diffs.length === 0 && (
+                            <tr>
+                              <td colSpan={4} className="text-center" style={{ padding: "1rem" }}>No parameter changes detected (whitespace or comment only edit).</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    <h4 style={{ marginTop: "1.5rem", marginBottom: "0.5rem" }}>Raw Config Diff Preview</h4>
+                    <pre className="modal-diff-pre">
+                      {computeRawDiff(update.old_content, update.new_content)}
+                    </pre>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="modal-footer">
+              <Button variant="secondary" onClick={() => setSelectedUpdatesForModal(null)}>Close</Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+function getDiffLines(oldText: string, newText: string) {
+  const oldLines = oldText.split("\n").map(l => l.trim());
+  const newLines = newText.split("\n").map(l => l.trim());
+
+  const oldParams: Record<string, string> = {};
+  oldLines.forEach(l => {
+    if (l && !l.startsWith("#") && l.includes("=")) {
+      const idx = l.indexOf("=");
+      oldParams[l.substring(0, idx).trim()] = l.substring(idx + 1).trim();
+    }
+  });
+
+  const newParams: Record<string, string> = {};
+  newLines.forEach(l => {
+    if (l && !l.startsWith("#") && l.includes("=")) {
+      const idx = l.indexOf("=");
+      newParams[l.substring(0, idx).trim()] = l.substring(idx + 1).trim();
+    }
+  });
+
+  const diffs: Array<{ type: "added" | "removed" | "modified"; param: string; oldVal?: string; newVal?: string }> = [];
+
+  Object.keys(oldParams).forEach(k => {
+    if (!(k in newParams)) {
+      diffs.push({ type: "removed", param: k, oldVal: oldParams[k] });
+    } else if (oldParams[k] !== newParams[k]) {
+      diffs.push({ type: "modified", param: k, oldVal: oldParams[k], newVal: newParams[k] });
+    }
+  });
+
+  Object.keys(newParams).forEach(k => {
+    if (!(k in oldParams)) {
+      diffs.push({ type: "added", param: k, newVal: newParams[k] });
+    }
+  });
+
+  return diffs;
+}
+
+function computeRawDiff(oldText: string, newText: string): string {
+  const oldLines = oldText.split("\n");
+  const newLines = newText.split("\n");
+
+  const diffLines: string[] = [];
+
+  const getLineKey = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || !trimmed.includes("=")) return null;
+    return trimmed.split("=")[0].trim();
+  };
+
+  const oldKeyMap: Record<string, string> = {};
+  oldLines.forEach(l => {
+    const k = getLineKey(l);
+    if (k) oldKeyMap[k] = l;
+  });
+
+  const newKeyMap: Record<string, string> = {};
+  newLines.forEach(l => {
+    const k = getLineKey(l);
+    if (k) newKeyMap[k] = l;
+  });
+
+  oldLines.forEach(l => {
+    const k = getLineKey(l);
+    if (k) {
+      if (!(k in newKeyMap)) {
+        diffLines.push(`- ${l}`);
+      } else if (newKeyMap[k] !== l) {
+        diffLines.push(`- ${l}`);
+        diffLines.push(`+ ${newKeyMap[k]}`);
+      }
+    }
+  });
+
+  newLines.forEach(l => {
+    const k = getLineKey(l);
+    if (k && !(k in oldKeyMap)) {
+      diffLines.push(`+ ${l}`);
+    }
+  });
+
+  return diffLines.join("\n") || "No text diff available.";
 }
 
 function buildPreview(content: string, recs: TuneRecommendation[]) {

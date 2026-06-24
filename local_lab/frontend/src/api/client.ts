@@ -93,6 +93,31 @@ export type ColdkeyWinnerRow = {
   rounds_participated: number;
 };
 
+export type ConfigChangeRecord = {
+  id: string;
+  timestamp: string;
+  template: string;
+  old_content: string;
+  new_content: string;
+  changed_params: string[];
+  changes: Array<{
+    param: string;
+    old_value: any;
+    new_value: any;
+  }>;
+  source: string;
+};
+
+export type LastUpdateAnalysis = {
+  round_id: string;
+  round_label: string;
+  score_before: number;
+  score_after: number;
+  difference: number;
+  message: string;
+  updates: ConfigChangeRecord[];
+};
+
 export type LeaderboardAnalytics = {
   rounds_analyzed: number;
   coldkey_mapping_available: boolean;
@@ -210,6 +235,7 @@ export type TunePipelineResult = {
       snp_final?: number;
       indel_final?: number;
       tool_name?: string;
+      updates?: ConfigChangeRecord[];
     }>;
   } | null;
   diagnosis: {
@@ -234,6 +260,7 @@ export type TunePipelineResult = {
       gaps: Record<string, { value: number; severity: string }>;
     };
   };
+  last_update_analysis?: LastUpdateAnalysis | null;
   recommendations: TuneRecommendation[];
   proposed_config: { content: string; changed_params: string[]; diff_summary: string[] };
   logs: TuneLogEntry[];
