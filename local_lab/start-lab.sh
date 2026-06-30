@@ -12,8 +12,15 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-BACKEND_PORT="${LAB_BACKEND_PORT:-8765}"
-FRONTEND_PORT="${LAB_FRONTEND_PORT:-5173}"
+# --- Configuration (edit here) ---
+EXTERNAL_PORT=5050       # Dashboard port — open http://<your-server-ip>:5050
+BACKEND_PORT=8765        # API port (proxied by the dashboard)
+LAB_BIND_HOST="0.0.0.0"  # Listen on all interfaces for external access
+# Optional: set your public/LAN IP for startup URLs (auto-detected if empty)
+LAB_EXTERNAL_HOST=""
+# --------------------------------
+
+FRONTEND_PORT="${EXTERNAL_PORT}"
 
 echo -e "${BOLD}Minos Local Lab${NC}"
 echo ""
@@ -48,26 +55,39 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo -e "${CYAN}Starting backend on http://127.0.0.1:${BACKEND_PORT}${NC}"
+DISPLAY_HOST="${LAB_EXTERNAL_HOST}"
+if [[ -z "${DISPLAY_HOST}" ]]; then
+  DISPLAY_HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+if [[ -z "${DISPLAY_HOST}" ]]; then
+  DISPLAY_HOST="127.0.0.1"
+fi
+
+echo -e "${CYAN}Starting backend on ${LAB_BIND_HOST}:${BACKEND_PORT}${NC}"
 PYTHONPATH="${PROJECT_DIR}" "${PYTHON}" -m uvicorn local_lab.backend.main:app \
-  --host 127.0.0.1 \
+  --host "${LAB_BIND_HOST}" \
   --port "${BACKEND_PORT}" \
   --reload &
 BACKEND_PID=$!
 
 sleep 1
 
-echo -e "${CYAN}Starting frontend on http://127.0.0.1:${FRONTEND_PORT}${NC}"
+echo -e "${CYAN}Starting frontend on ${LAB_BIND_HOST}:${FRONTEND_PORT}${NC}"
 (
   cd local_lab/frontend
-  npm run dev -- --host 127.0.0.1 --port "${FRONTEND_PORT}"
+  LAB_BIND_HOST="${LAB_BIND_HOST}" \
+  LAB_BACKEND_PORT="${BACKEND_PORT}" \
+  LAB_FRONTEND_PORT="${FRONTEND_PORT}" \
+    npm run dev
 ) &
 FRONTEND_PID=$!
 
 echo ""
 echo -e "${GREEN}${BOLD}Local Lab is running${NC}"
-echo -e "  Dashboard: ${CYAN}http://127.0.0.1:${FRONTEND_PORT}${NC}"
-echo -e "  API:       ${CYAN}http://127.0.0.1:${BACKEND_PORT}/api/meta${NC}"
+echo -e "  Dashboard (local):    ${CYAN}http://127.0.0.1:${FRONTEND_PORT}${NC}"
+echo -e "  Dashboard (external): ${CYAN}http://${DISPLAY_HOST}:${FRONTEND_PORT}${NC}"
+echo -e "  API (local):          ${CYAN}http://127.0.0.1:${BACKEND_PORT}/api/meta${NC}"
+echo -e "  API (external):       ${CYAN}http://${DISPLAY_HOST}:${BACKEND_PORT}/api/meta${NC}"
 echo -e "  Press Ctrl+C to stop"
 echo ""
 

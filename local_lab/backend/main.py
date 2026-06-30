@@ -33,7 +33,8 @@ from local_lab.backend.services.leaderboard_service import (
     list_rounds,
     sync_all_finalized,
 )
-from local_lab.backend.services.tune_service import apply_tune_recommendations, run_tune_pipeline
+from local_lab.backend.services.llm_tune_service import get_llm_tune_status
+from local_lab.backend.services.tune_service import apply_tune_recommendations, run_llm_judge, run_tune_pipeline
 from local_lab.backend.services.vcf_service import find_latest_vcf, summarize_vcf
 
 app = FastAPI(
@@ -62,6 +63,18 @@ class DemoStartRequest(BaseModel):
 class TuneApplyRequest(BaseModel):
     template: str = Field(default="gatk", pattern="^(gatk|deepvariant|bcftools)$")
     recommendations: list[dict] = Field(default_factory=list)
+
+
+class LlmJudgeRequest(BaseModel):
+    template: str = Field(default="gatk", pattern="^(gatk|deepvariant|bcftools)$")
+    current_config: dict = Field(default_factory=dict)
+    diagnosis: dict = Field(default_factory=dict)
+    rule_recommendations: list[dict] = Field(default_factory=list)
+    top_miner_summary: dict = Field(default_factory=dict)
+    my_performance: dict | None = None
+    last_update_analysis: dict | None = None
+    region_analysis: dict | None = None
+    logs: list[dict] = Field(default_factory=list)
 
 
 @app.get("/api/meta")
@@ -227,14 +240,46 @@ def api_leaderboard_my_hotkey():
     return {"hotkey": hk, "coldkey": get_my_coldkey(), "configured": hk is not None}
 
 
+@app.get("/api/tune/llm-status")
+def api_tune_llm_status():
+    return get_llm_tune_status()
+
+
 @app.get("/api/tune/analyze")
 def api_tune_analyze(
     template: str = "gatk",
     rounds: int = 30,
     sync: bool = False,
+    use_llm: bool = False,
 ):
     try:
-        return run_tune_pipeline(template=template, rounds_limit=rounds, force_sync=sync)
+        return run_tune_pipeline(
+            template=template,
+            rounds_limit=rounds,
+            force_sync=sync,
+            use_llm=use_llm,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/api/tune/llm-judge")
+def api_tune_llm_judge(body: LlmJudgeRequest):
+    try:
+        params = body.current_config.get("params") if isinstance(body.current_config, dict) else {}
+        if not params and isinstance(body.current_config, dict):
+            params = body.current_config
+        return run_llm_judge(
+            template=body.template,
+            current_params=params,
+            diagnosis=body.diagnosis,
+            rule_recommendations=body.rule_recommendations,
+            top_summary=body.top_miner_summary,
+            my_perf=body.my_performance,
+            last_update_analysis=body.last_update_analysis,
+            region_analysis=body.region_analysis,
+            prior_logs=body.logs,
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

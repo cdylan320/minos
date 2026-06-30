@@ -44,6 +44,8 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
   const [showLogs, setShowLogs] = useState(true);
   const logEndRef = useRef<HTMLDivElement>(null);
   const [selectedUpdatesForModal, setSelectedUpdatesForModal] = useState<ConfigChangeRecord[] | null>(null);
+  const [llmStatus, setLlmStatus] = useState<{ configured: boolean; enabled: boolean; model: string } | null>(null);
+  const [llmJudging, setLlmJudging] = useState(false);
 
   const runAnalysis = useCallback(async () => {
     setLoading(true);
@@ -62,6 +64,48 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
   useEffect(() => {
     runAnalysis();
   }, [template]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    api.tuneLlmStatus().then(setLlmStatus).catch(() => setLlmStatus(null));
+  }, []);
+
+  const runLlmJudge = useCallback(async () => {
+    if (!report) return;
+    setLlmJudging(true);
+    setMsg("");
+    try {
+      const ruleRecs = report.rule_recommendations ?? report.recommendations;
+      const result = await api.tuneLlmJudge({
+        template,
+        current_config: report.current_config,
+        diagnosis: report.diagnosis,
+        rule_recommendations: ruleRecs,
+        top_miner_summary: report.top_miner_analysis.summary,
+        my_performance: report.my_performance,
+        last_update_analysis: report.last_update_analysis,
+        region_analysis: report.region_analysis,
+        logs: report.logs,
+      });
+      setReport((prev) =>
+        prev
+          ? {
+              ...prev,
+              recommendations: result.recommendations,
+              llm_advisory: result.llm_advisory,
+              rule_recommendation_count: result.rule_recommendation_count,
+              proposed_config: result.proposed_config,
+              logs: result.logs,
+            }
+          : prev,
+      );
+      setRecs(result.recommendations.map((r) => ({ ...r })));
+      setMsg("LLM judge complete — recommendations ranked.");
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLlmJudging(false);
+    }
+  }, [report, template]);
 
   useEffect(() => {
     if (showLogs) logEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -121,8 +165,9 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
           </Button>
         </div>
         <p className="tune-toolbar-note">
-          <strong>Run tune pipeline</strong> analyzes only — it does not change your config.
-          Use <strong>Apply changes</strong> below to write <code>configs/{template}.conf</code>.
+          <strong>Run tune pipeline</strong> uses rules only (no API cost). Click <strong>LLM judge</strong> below
+          to rank recommendations via OpenRouter when you want AI review.
+          Use <strong>Apply changes</strong> to write <code>configs/{template}.conf</code>.
         </p>
       </div>
 
@@ -340,13 +385,71 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
           )}
 
           <div className="card tune-card">
-            <div className="card__header">
+            <div className="card__header tune-recs-header">
               <h2>Recommendations</h2>
-              <span className="card__meta">{selectedRecs.length} selected</span>
+              <div className="tune-recs-header__actions">
+                <span
+                  title={
+                    !llmStatus?.configured
+                      ? "Set OPENROUTER_API_KEY in .env"
+                      : `Rank ${report?.rule_recommendation_count ?? report?.recommendations.length ?? 0} rule candidate(s) via ${llmStatus?.model ?? "OpenRouter"} (API cost applies)`
+                  }
+                >
+                  <Button
+                    variant="secondary"
+                    onClick={runLlmJudge}
+                    disabled={
+                      llmJudging ||
+                      loading ||
+                      !report ||
+                      !(report.rule_recommendations?.length || report.recommendations.length) ||
+                      !llmStatus?.configured ||
+                      !llmStatus?.enabled
+                    }
+                  >
+                    {llmJudging ? "LLM judging…" : "LLM judge"}
+                  </Button>
+                </span>
+                <span className="card__meta">{selectedRecs.length} selected</span>
+              </div>
             </div>
             <div className="card__body">
+            {report.llm_advisory && (
+              <div className={`tune-llm-advisory ${report.llm_advisory.used ? "tune-llm-advisory--on" : ""}`}>
+                <div className="tune-llm-advisory__head">
+                  <h4>LLM advisory {report.llm_advisory.used ? "(active)" : "(rules only)"}</h4>
+                  <span className="tune-llm-advisory__model">{report.llm_advisory.model}</span>
+                </div>
+                {!report.llm_advisory.configured && (
+                  <p className="tune-llm-advisory__msg">
+                    Add <code>OPENROUTER_API_KEY</code> to <code>.env</code> to enable LLM ranking after the rule engine.
+                    Default model: <code>{report.llm_advisory.model}</code>.
+                  </p>
+                )}
+                {report.llm_advisory.configured && !report.llm_advisory.used && report.llm_advisory.notes && (
+                  <p className="tune-llm-advisory__msg">{report.llm_advisory.notes}</p>
+                )}
+                {report.llm_advisory.error && (
+                  <p className="tune-llm-advisory__msg tune-llm-advisory__msg--warn">{report.llm_advisory.error}</p>
+                )}
+                {report.llm_advisory.used && report.llm_advisory.summary && (
+                  <p className="tune-llm-advisory__msg">{report.llm_advisory.summary}</p>
+                )}
+                {report.llm_advisory.used && report.llm_advisory.strategy && (
+                  <p className="tune-llm-advisory__strategy">
+                    Strategy: <strong>{report.llm_advisory.strategy}</strong>
+                    {typeof report.rule_recommendation_count === "number" && (
+                      <> · {report.rule_recommendation_count} rule candidate(s) ranked</>
+                    )}
+                  </p>
+                )}
+              </div>
+            )}
             {recs.length === 0 ? (
-              <p className="tune-empty">No changes suggested — your config matches current heuristics.</p>
+              <p className="tune-empty">
+                No changes suggested — your config already matches all heuristic targets for the current score gap.
+                If your score recently dropped after an update, re-run the pipeline; rollback suggestions appear when the last config change hurt performance.
+              </p>
             ) : (
               <div className="tune-recs">
                 {recs.map((r) => (
@@ -356,7 +459,10 @@ export function TunePanel({ template, onConfigApplied, onRunDemo }: Props) {
                       <div className="tune-rec__head">
                         <code>{r.param}</code>
                         <span>{String(r.current_value)} → <strong>{String(r.proposed_value)}</strong></span>
-                        <span className="tune-rec__src">{r.source}</span>
+                        <span className={`tune-rec__src tune-rec__src--${r.source.replace(/_/g, "-")}`}>{r.source}</span>
+                        {r.llm_confidence && (
+                          <span className="tune-rec__conf">{r.llm_confidence}</span>
+                        )}
                       </div>
                       <p>{r.reason}</p>
                     </div>

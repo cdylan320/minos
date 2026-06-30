@@ -7,7 +7,8 @@ import statistics
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from local_lab.backend.services.config_service import read_config, write_config
+from local_lab.backend.services.llm_tune_service import enhance_recommendations_with_llm
+from local_lab.backend.services.config_service import read_config, read_config_history, write_config
 from local_lab.backend.services.leaderboard_service import (
     _get_hotkey_coldkey_map,
     _load_cached_finalized_leaderboards,
@@ -333,75 +334,96 @@ def _analyze_my_performance(
 def _analyze_last_updates(
     my_perf: Optional[Dict[str, Any]],
     logs: List[Dict[str, Any]],
+    template: str = "gatk",
 ) -> Optional[Dict[str, Any]]:
     if not my_perf or not my_perf.get("history"):
         return None
 
-    history = my_perf["history"]
-    rounds_with_updates = [r for r in history if r.get("updates")]
-
-    if not rounds_with_updates:
+    cfg_history = [c for c in read_config_history() if c.get("template") == template]
+    if not cfg_history:
         _log(logs, "tune_logic", "info", "No previous Local Lab config updates found in analyzed round range")
         return None
 
-    r_updated = rounds_with_updates[0]
-    rid = r_updated["round_id"]
+    last_update = cfg_history[-1]
+    update_ts = parse_date(last_update.get("timestamp", ""))
 
-    history_chrono = sorted(history, key=lambda x: parse_date(x.get("submitted_at") or x.get("round_id")))
-    idx = -1
-    for i, r in enumerate(history_chrono):
-        if r["round_id"] == rid:
-            idx = i
-            break
-
-    if idx <= 0:
-        _log(logs, "tune_logic", "info", f"Found config update in round {_format_round_short(rid)}, but no previous round to compare against")
+    scored = [
+        r for r in my_perf["history"]
+        if r.get("combined_final") is not None
+    ]
+    if not scored:
         return None
 
-    r_prev = history_chrono[idx - 1]
+    scored_chrono = sorted(
+        scored,
+        key=lambda x: parse_date(x.get("submitted_at") or x.get("round_id")),
+    )
 
-    score_now = r_updated.get("combined_final")
-    score_prev = r_prev.get("combined_final")
+    before = [
+        r for r in scored_chrono
+        if parse_date(r.get("submitted_at") or r.get("round_id")) < update_ts
+    ]
+    after = [
+        r for r in scored_chrono
+        if parse_date(r.get("submitted_at") or r.get("round_id")) >= update_ts
+    ]
 
-    if score_now is None or score_prev is None:
+    latest = my_perf.get("latest_round") or scored_chrono[-1]
+    score_after = float(latest.get("combined_final") or 0.0)
+
+    if before:
+        recent_before = before[-min(3, len(before)):]
+        score_before = statistics.mean(r["combined_final"] for r in recent_before)
+    elif after:
+        score_before = float(after[0].get("combined_final") or score_after)
+    else:
         return None
 
-    diff = score_now - score_prev
+    diff = round(score_after - score_before, 4)
+
     updates_desc = []
-    for u in r_updated["updates"]:
-        for ch in u.get("changes", []):
-            updates_desc.append(f"{ch['param']} ({ch['old_value']} -> {ch['new_value']})")
-
+    for ch in last_update.get("changes", []):
+        updates_desc.append(f"{ch['param']} ({ch['old_value']} -> {ch['new_value']})")
     updates_str = ", ".join(updates_desc)
+
+    update_label = _format_round_short(last_update.get("timestamp", ""))
+    needs_rollback = diff < -0.05 or (
+        diff < -0.01 and score_after < score_before * 0.85
+    )
 
     analysis_msg = ""
     if diff > 0.01:
         analysis_msg = (
-            f"Your last configuration update ({updates_str}) in round {_format_round_short(rid)} "
-            f"saw your score IMPROVE by {diff:+.4f} (from {score_prev:.4f} to {score_now:.4f}). This change is performing well!"
+            f"Your last configuration update ({updates_str}) at {update_label} "
+            f"saw your score IMPROVE by {diff:+.4f} (from {score_before:.4f} to {score_after:.4f}). This change is performing well!"
         )
         _log(logs, "tune_logic", "success", analysis_msg)
     elif diff < -0.01:
         analysis_msg = (
-            f"Your last configuration update ({updates_str}) in round {_format_round_short(rid)} "
-            f"saw your score DECREASE by {diff:.4f} (from {score_prev:.4f} to {score_now:.4f}). Consider reverting or adjusting further."
+            f"Your last configuration update ({updates_str}) at {update_label} "
+            f"saw your score DECREASE by {diff:.4f} (from {score_before:.4f} to {score_after:.4f}). "
+            "The pipeline will suggest rollback plus moderate upgrades — reverting alone is not enough since the prior baseline also trailed top miners."
         )
         _log(logs, "tune_logic", "warn", analysis_msg)
     else:
         analysis_msg = (
-            f"Your last configuration update ({updates_str}) in round {_format_round_short(rid)} "
-            f"kept your score stable (change of {diff:+.4f}, from {score_prev:.4f} to {score_now:.4f})."
+            f"Your last configuration update ({updates_str}) at {update_label} "
+            f"kept your score stable (change of {diff:+.4f}, from {score_before:.4f} to {score_after:.4f})."
         )
         _log(logs, "tune_logic", "info", analysis_msg)
 
     return {
-        "round_id": rid,
-        "round_label": _format_round_short(rid),
-        "score_before": score_prev,
-        "score_after": score_now,
+        "round_id": latest.get("round_id"),
+        "round_label": _format_round_short(latest.get("round_id", "")),
+        "update_timestamp": last_update.get("timestamp"),
+        "score_before": round(score_before, 4),
+        "score_after": round(score_after, 4),
         "difference": diff,
+        "needs_rollback": needs_rollback,
         "message": analysis_msg,
-        "updates": r_updated["updates"]
+        "updates": [last_update],
+        "rounds_before_update": len(before),
+        "rounds_after_update": len(after),
     }
 
 
@@ -543,19 +565,319 @@ def _clamp_param(tool: str, param: str, value: Any) -> Any:
     return value
 
 
+def _param_values_equal(cur: Any, proposed: Any) -> bool:
+    if isinstance(cur, bool) or isinstance(proposed, bool):
+        return str(cur).lower() == str(proposed).lower()
+    if isinstance(cur, (int, float)) and isinstance(proposed, (int, float)):
+        return float(cur) == float(proposed)
+    return cur == proposed
+
+
+def _is_aggressive_gatk_config(current: Dict[str, Any]) -> bool:
+    conf = float(current.get("standard_min_confidence_threshold_for_calling", 30))
+    base_q = int(current.get("min_base_quality_score", 10))
+    map_q = int(current.get("min_mapping_quality_score", 20))
+    recover = str(current.get("recover_all_dangling_branches", "false")).lower() == "true"
+    return conf <= 15 or base_q <= 7 or map_q <= 15 or recover
+
+
+def _simulate_baseline_after_rollback(
+    current: Dict[str, Any],
+    updates: List[Dict[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
+    """Return config params after reverting the failed update, plus change map per param."""
+    baseline = dict(current)
+    failed: Dict[str, Dict[str, Any]] = {}
+    for update in updates:
+        for ch in update.get("changes") or []:
+            param = ch["param"]
+            baseline[param] = ch["old_value"]
+            failed[param] = {"old_value": ch["old_value"], "new_value": ch["new_value"]}
+    return baseline, failed
+
+
+def _suggest_gatk_balanced_upgrades(
+    baseline: Dict[str, Any],
+    combined_gap: float,
+    snp_gap: float,
+    indel_gap: float,
+    failed_new_by_param: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Moderate improvements from rollback baseline toward top miners.
+    Avoids repeating values from the failed aggressive update.
+    """
+    upgrades: Dict[str, Any] = {}
+
+    def avoid(param: str, value: Any) -> bool:
+        failed_val = failed_new_by_param.get(param, {}).get("new_value")
+        if failed_val is None:
+            return True
+        return not _param_values_equal(value, failed_val)
+
+    conf = float(baseline.get("standard_min_confidence_threshold_for_calling", 25))
+    if combined_gap > 0.05 and conf >= 22 and avoid("standard_min_confidence_threshold_for_calling", 22):
+        upgrades["standard_min_confidence_threshold_for_calling"] = 22
+
+    base_q = int(baseline.get("min_base_quality_score", 8))
+    if combined_gap > 0.05 and base_q >= 7 and avoid("min_base_quality_score", 7):
+        upgrades["min_base_quality_score"] = 7
+
+    map_q = int(baseline.get("min_mapping_quality_score", 20))
+    if combined_gap > 0.05 and map_q >= 18 and avoid("min_mapping_quality_score", 18):
+        upgrades["min_mapping_quality_score"] = 18
+
+    snp_het = float(baseline.get("heterozygosity", 0.001))
+    if snp_gap > 0.05 and snp_het <= 0.0015 and avoid("heterozygosity", 0.0015):
+        upgrades["heterozygosity"] = 0.0015
+
+    indel_het = float(baseline.get("indel_heterozygosity", 0.000125))
+    if indel_gap > 0.05 and indel_het <= 0.000175 and avoid("indel_heterozygosity", 0.000175):
+        upgrades["indel_heterozygosity"] = 0.000175
+
+    max_reads = int(baseline.get("max_reads_per_alignment_start", 50))
+    if combined_gap > 0.05 and max_reads <= 100 and avoid("max_reads_per_alignment_start", 100):
+        upgrades["max_reads_per_alignment_start"] = 100
+
+    padding = int(baseline.get("assembly_region_padding", 100))
+    if combined_gap > 0.03 and padding < 150:
+        upgrades["assembly_region_padding"] = 150
+
+    max_asm = int(baseline.get("max_assembly_region_size", 300))
+    if combined_gap > 0.03 and max_asm < 400:
+        upgrades["max_assembly_region_size"] = 400
+
+    active_p = float(baseline.get("active_probability_threshold", 0.002))
+    if snp_gap > 0.05 and active_p > 0.0015:
+        upgrades["active_probability_threshold"] = 0.0015
+
+    bq_thresh = int(baseline.get("base_quality_score_threshold", 18))
+    if snp_gap > 0.05 and bq_thresh > 15:
+        upgrades["base_quality_score_threshold"] = 15
+
+    # Do NOT re-enable failed assembly toggles (recover_all_dangling_branches, min_pruning=1, max_alt=12)
+    return upgrades
+
+
+def _build_rollback_and_upgrade(
+    template: str,
+    current: Dict[str, Any],
+    last_update_analysis: Dict[str, Any],
+    diagnosis: Dict[str, Any],
+    add,
+    logs: List[Dict[str, Any]],
+) -> None:
+    """Revert failed update, then suggest moderate upgrades from that baseline."""
+    updates = last_update_analysis.get("updates") or []
+    score_drop = float(last_update_analysis.get("difference", 0.0))
+    score_before = float(last_update_analysis.get("score_before", 0.0))
+
+    baseline, failed_by_param = _simulate_baseline_after_rollback(current, updates)
+    gaps = diagnosis.get("gaps", {})
+    combined_gap = float(gaps.get("combined", {}).get("value", 0.0) or 0.0)
+    snp_gap = float(gaps.get("snp", {}).get("value", 0.0) or 0.0)
+    indel_gap = float(gaps.get("indel", {}).get("value", 0.0) or 0.0)
+
+    _log(
+        logs, "recommendations_engine", "warn",
+        f"Last update dropped score by {abs(score_drop):.4f} (baseline ~{score_before:.4f} was still below top miners). "
+        "Planning rollback + moderate upgrade path.",
+    )
+
+    upgrades: Dict[str, Any] = {}
+    if template == "gatk":
+        upgrades = _suggest_gatk_balanced_upgrades(
+            baseline, combined_gap, snp_gap, indel_gap, failed_by_param,
+        )
+        if upgrades:
+            _log(
+                logs, "recommendations_engine", "info",
+                f"Generated {len(upgrades)} moderate upgrade(s) from rollback baseline",
+                {"params": list(upgrades.keys())},
+            )
+
+    for update in updates:
+        for ch in update.get("changes") or []:
+            param = ch["param"]
+            old_val = ch["old_value"]
+            new_val = ch["new_value"]
+            target = upgrades.get(param, old_val)
+
+            if param in upgrades and not _param_values_equal(target, old_val):
+                add(
+                    param,
+                    target,
+                    (
+                        f"Revert failed change ({new_val} was too aggressive, score fell {abs(score_drop):.4f}), "
+                        f"then moderate upgrade from baseline {old_val} → {target}. "
+                        f"Previous baseline (~{score_before:.4f}) still trailed top miners — this is a smaller step toward improvement."
+                    ),
+                    5,
+                    "rollback_upgrade",
+                )
+            else:
+                add(
+                    param,
+                    old_val,
+                    (
+                        f"Revert failed change: {param} {new_val} → {old_val} "
+                        f"(score fell {abs(score_drop):.4f} after last update)."
+                    ),
+                    0,
+                    "rollback",
+                )
+
+    # Upgrades on params NOT touched by the failed update
+    for param, target in upgrades.items():
+        if param in failed_by_param:
+            continue
+        base_val = baseline.get(param)
+        if _param_values_equal(base_val, target):
+            continue
+        add(
+            param,
+            target,
+            (
+                f"Improvement from rollback baseline ({base_val} → {target}): moderate tuning toward top miners "
+                f"without repeating the failed aggressive update."
+            ),
+            20,
+            "improvement",
+        )
+
+
+def _suggest_rollback_recommendations(
+    template: str,
+    current: Dict[str, Any],
+    update_record: Dict[str, Any],
+    score_drop: float,
+    add,
+    logs: List[Dict[str, Any]],
+) -> None:
+    """Legacy single-step rollback (used only as fallback)."""
+    changes = update_record.get("changes") or []
+    if not changes:
+        return
+
+    _log(
+        logs, "recommendations_engine", "warn",
+        f"Last config update dropped score by {abs(score_drop):.4f} — suggesting rollback of {len(changes)} parameter(s)",
+    )
+
+    for ch in changes:
+        param = ch["param"]
+        old_val = ch["old_value"]
+        new_val = ch["new_value"]
+        add(
+            param,
+            old_val,
+            (
+                f"Rollback: your last update changed {param} from {old_val} to {new_val} "
+                f"and combined score fell by {abs(score_drop):.4f}. Reverting to {old_val}."
+            ),
+            0,
+            "rollback",
+        )
+
+
+def _suggest_gatk_precision_recovery(
+    current: Dict[str, Any],
+    combined_gap: float,
+    add,
+    logs: List[Dict[str, Any]],
+) -> None:
+    """When aggressive recall tuning is maxed but score is still bad, try precision-focused values."""
+    _log(
+        logs, "recommendations_engine", "decision",
+        f"Config is already aggressively tuned but gap remains {combined_gap:.4f} — trying precision/recovery path",
+    )
+
+    conf = float(current.get("standard_min_confidence_threshold_for_calling", 10))
+    if conf < 25:
+        add(
+            "standard_min_confidence_threshold_for_calling", 25,
+            f"Raising calling threshold from {conf} to 25 reduces false-positive variants that hurt hap.py F1 score.",
+            10, "precision_recovery",
+        )
+
+    base_q = int(current.get("min_base_quality_score", 5))
+    if base_q < 8:
+        add(
+            "min_base_quality_score", 8,
+            f"Raising base quality from {base_q} to 8 filters low-quality bases that create spurious calls.",
+            11, "precision_recovery",
+        )
+
+    map_q = int(current.get("min_mapping_quality_score", 12))
+    if map_q < 18:
+        add(
+            "min_mapping_quality_score", 18,
+            f"Raising mapping quality from {map_q} to 18 removes poorly aligned reads that inflate FP rate.",
+            12, "precision_recovery",
+        )
+
+    snp_het = float(current.get("heterozygosity", 0.003))
+    if snp_het > 0.0015:
+        add(
+            "heterozygosity", 0.001,
+            f"Lowering heterozygosity prior from {snp_het} to 0.001 reduces over-calling of marginal SNPs.",
+            13, "precision_recovery",
+        )
+
+    indel_het = float(current.get("indel_heterozygosity", 0.0003))
+    if indel_het > 0.00015:
+        add(
+            "indel_heterozygosity", 0.000125,
+            f"Lowering indel prior from {indel_het} to default 0.000125 reduces noisy indel calls.",
+            14, "precision_recovery",
+        )
+
+    if str(current.get("recover_all_dangling_branches", "false")).lower() == "true":
+        add(
+            "recover_all_dangling_branches", "false",
+            "Disabling dangling branch recovery reduces assembly-graph false paths that hurt precision.",
+            15, "precision_recovery",
+        )
+
+    min_prune = int(current.get("min_pruning", 1))
+    if min_prune < 2:
+        add(
+            "min_pruning", 2,
+            "Restoring min_pruning to 2 prunes weak assembly paths that generate false variants.",
+            16, "precision_recovery",
+        )
+
+    max_alt = int(current.get("max_alternate_alleles", 12))
+    if max_alt > 6:
+        add(
+            "max_alternate_alleles", 6,
+            "Lowering max alternate alleles from 12 to 6 avoids unstable multi-allelic genotyping.",
+            17, "precision_recovery",
+        )
+
+    max_reads = int(current.get("max_reads_per_alignment_start", 150))
+    if max_reads > 75:
+        add(
+            "max_reads_per_alignment_start", 75,
+            "Moderate downsampling (75 reads/start) can reduce duplicate-driven false calls while keeping depth.",
+            18, "precision_recovery",
+        )
+
+
 def _build_recommendations(
     template: str,
     current: Dict[str, Any],
     diagnosis: Dict[str, Any],
     top_summary: Dict[str, Any],
     logs: List[Dict[str, Any]],
+    last_update_analysis: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     recs: List[Dict[str, Any]] = []
 
     def add(param: str, new_value: Any, reason: str, priority: int, source: str) -> None:
         cur = current.get(param)
         clamped = _clamp_param(template, param, new_value)
-        if cur == clamped:
+        if _param_values_equal(cur, clamped):
             return
         recs.append({
             "id": f"{param}_{clamped}",
@@ -568,7 +890,6 @@ def _build_recommendations(
             "selected": True,
         })
 
-    # Fetch and evaluate quality gaps to customize recommendations dynamically
     gaps = diagnosis.get("gaps", {})
     combined_gap = float(gaps.get("combined", {}).get("value", 0.0) or 0.0)
     snp_gap = float(gaps.get("snp", {}).get("value", 0.0) or 0.0)
@@ -576,10 +897,17 @@ def _build_recommendations(
 
     _log(
         logs, "recommendations_engine", "info",
-        f"Evaluating score gaps vs top miners: Combined={combined_gap:+.4f}, SNP={snp_gap:+.4f}, INDEL={indel_gap:+.4f}"
+        f"Evaluating score gaps vs top miners: Combined={combined_gap:+.4f}, SNP={snp_gap:+.4f}, INDEL={indel_gap:+.4f}",
     )
 
-    if template == "gatk":
+    # Failed update: rollback + moderate upgrade (not rollback-only)
+    needs_rollback = bool(last_update_analysis and last_update_analysis.get("needs_rollback"))
+    if needs_rollback:
+        _build_rollback_and_upgrade(
+            template, current, last_update_analysis, diagnosis, add, logs,
+        )
+
+    if template == "gatk" and not needs_rollback:
         # PCR indel model is always NONE for PCR-free benchmark BAMs
         if current.get("pcr_indel_model") != "NONE":
             add(
@@ -708,6 +1036,10 @@ def _build_recommendations(
                 6, "depth_opt",
             )
 
+        # When aggressive recall tuning is already applied but score is still bad, try precision path
+        if not recs and combined_gap > 0.02 and _is_aggressive_gatk_config(current):
+            _suggest_gatk_precision_recovery(current, combined_gap, add, logs)
+
     elif template == "deepvariant":
         if current.get("model_type") != "WGS":
             add("model_type", "WGS", "Minos BAMs are whole-genome — WES mode hurts scores.", 1, "tuning_guide")
@@ -800,6 +1132,21 @@ def _build_recommendations(
                 4, "score_diagnosis",
             )
 
+    # Absolute fallback: if still no suggestions but score gap is significant
+    if not recs and combined_gap > 0.02 and not needs_rollback:
+        cfg_history = [c for c in read_config_history() if c.get("template") == template]
+        if cfg_history:
+            last_cfg = cfg_history[-1]
+            drop = float(last_update_analysis.get("difference", 0.0)) if last_update_analysis else -combined_gap
+            _suggest_rollback_recommendations(template, current, last_cfg, drop, add, logs)
+
+    if not recs and combined_gap > 0.02:
+        _log(
+            logs, "recommendations_engine", "warn",
+            f"Score gap is {combined_gap:.4f} but no parameter changes remain — config may match all known heuristic targets. "
+            "Try Run demo locally, or switch tool template (gatk/deepvariant/bcftools).",
+        )
+
     recs.sort(key=lambda r: r["priority"])
     _log(logs, "recommendations", "success", f"Generated {len(recs)} parameter recommendation(s)", {"count": len(recs)})
     for r in recs:
@@ -840,11 +1187,63 @@ def _apply_recommendations_to_content(
     return "\n".join(lines) + ("\n" if content.endswith("\n") else ""), changed_keys
 
 
+def run_llm_judge(
+    template: str,
+    current_params: Dict[str, Any],
+    diagnosis: Dict[str, Any],
+    rule_recommendations: List[Dict[str, Any]],
+    top_summary: Dict[str, Any],
+    my_perf: Optional[Dict[str, Any]],
+    last_update_analysis: Optional[Dict[str, Any]],
+    region_analysis: Optional[Dict[str, Any]],
+    prior_logs: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Run OpenRouter LLM ranking on existing rule-based analysis (on-demand, costs API credits)."""
+    logs: List[Dict[str, Any]] = list(prior_logs or [])
+    template = template.lower().strip()
+    _log(logs, "llm_judge", "info", f"User requested LLM judge for {len(rule_recommendations)} rule candidate(s)")
+
+    llm_out = enhance_recommendations_with_llm(
+        template=template,
+        current_params=current_params,
+        diagnosis=diagnosis,
+        rule_recommendations=rule_recommendations,
+        top_summary=top_summary,
+        my_perf=my_perf,
+        last_update_analysis=last_update_analysis,
+        region_analysis=region_analysis,
+        logs=logs,
+    )
+    recommendations = llm_out["recommendations"]
+    llm_advisory = llm_out.get("llm_advisory")
+
+    current_content = read_config(template)["content"]
+    proposed_content, applied_keys = _apply_recommendations_to_content(current_content, recommendations)
+    diff_lines = [
+        f"- {rec['param']}: {rec['current_value']} → {rec['proposed_value']}"
+        for rec in recommendations
+        if rec.get("selected", True)
+    ]
+
+    return {
+        "recommendations": recommendations,
+        "llm_advisory": llm_advisory,
+        "rule_recommendation_count": len(rule_recommendations),
+        "proposed_config": {
+            "content": proposed_content,
+            "changed_params": applied_keys,
+            "diff_summary": diff_lines,
+        },
+        "logs": logs,
+    }
+
+
 def run_tune_pipeline(
     template: str = "gatk",
     rounds_limit: int = 30,
     my_hotkey: Optional[str] = None,
     force_sync: bool = False,
+    use_llm: bool = False,
 ) -> Dict[str, Any]:
     logs: List[Dict[str, Any]] = []
     template = template.lower().strip()
@@ -900,11 +1299,45 @@ def run_tune_pipeline(
     region_analysis = _analyze_regions(leaderboards, logs)
     top_analysis = _analyze_top_miners(leaderboards, hotkey_to_coldkey, logs)
     my_perf = _analyze_my_performance(hotkey, leaderboards, logs, template)
-    last_up_analysis = _analyze_last_updates(my_perf, logs)
+    last_up_analysis = _analyze_last_updates(my_perf, logs, template)
     diagnosis = _diagnose(my_perf, top_analysis["summary"], top_analysis["recent_winners"], logs)
-    recommendations = _build_recommendations(
+    rule_recommendations = _build_recommendations(
         template, current_params, diagnosis, top_analysis["summary"], logs,
+        last_update_analysis=last_up_analysis,
     )
+
+    from local_lab.backend.services.llm_tune_service import get_llm_tune_status
+
+    llm_status = get_llm_tune_status()
+    if use_llm:
+        llm_out = enhance_recommendations_with_llm(
+            template=template,
+            current_params=current_params,
+            diagnosis=diagnosis,
+            rule_recommendations=rule_recommendations,
+            top_summary=top_analysis["summary"],
+            my_perf=my_perf,
+            last_update_analysis=last_up_analysis,
+            region_analysis=region_analysis,
+            logs=logs,
+        )
+        recommendations = llm_out["recommendations"]
+        llm_advisory = llm_out.get("llm_advisory")
+    else:
+        recommendations = rule_recommendations
+        llm_advisory = {
+            "enabled": llm_status["configured"] and llm_status["enabled"],
+            "configured": llm_status["configured"],
+            "model": llm_status["model"],
+            "used": False,
+            "summary": None,
+            "strategy": None,
+            "notes": (
+                "Rules-only run (no API cost). Click LLM judge to rank recommendations via OpenRouter."
+            ),
+            "error": None,
+        }
+        _log(logs, "llm_advisory", "info", "Skipped LLM — use LLM judge button to run OpenRouter ranking on demand")
 
     proposed_content, applied_keys = _apply_recommendations_to_content(current_content, recommendations)
     diff_lines = []
@@ -933,6 +1366,9 @@ def run_tune_pipeline(
         "my_performance": my_perf,
         "diagnosis": diagnosis,
         "last_update_analysis": last_up_analysis,
+        "llm_advisory": llm_advisory,
+        "rule_recommendation_count": len(rule_recommendations),
+        "rule_recommendations": rule_recommendations,
         "recommendations": recommendations,
         "proposed_config": {
             "content": proposed_content,

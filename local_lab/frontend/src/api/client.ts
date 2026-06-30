@@ -111,11 +111,15 @@ export type ConfigChangeRecord = {
 export type LastUpdateAnalysis = {
   round_id: string;
   round_label: string;
+  update_timestamp?: string;
   score_before: number;
   score_after: number;
   difference: number;
+  needs_rollback?: boolean;
   message: string;
   updates: ConfigChangeRecord[];
+  rounds_before_update?: number;
+  rounds_after_update?: number;
 };
 
 export type LeaderboardAnalytics = {
@@ -165,6 +169,19 @@ export type TuneRecommendation = {
   priority: number;
   source: string;
   selected?: boolean;
+  llm_rank?: number;
+  llm_confidence?: string;
+};
+
+export type LlmTuneAdvisory = {
+  enabled: boolean;
+  configured: boolean;
+  model: string;
+  used: boolean;
+  summary?: string | null;
+  strategy?: string | null;
+  notes?: string | null;
+  error?: string | null;
 };
 
 export type TunePipelineResult = {
@@ -261,6 +278,9 @@ export type TunePipelineResult = {
     };
   };
   last_update_analysis?: LastUpdateAnalysis | null;
+  llm_advisory?: LlmTuneAdvisory | null;
+  rule_recommendation_count?: number;
+  rule_recommendations?: TuneRecommendation[];
   recommendations: TuneRecommendation[];
   proposed_config: { content: string; changed_params: string[]; diff_summary: string[] };
   logs: TuneLogEntry[];
@@ -339,7 +359,33 @@ export const api = {
   }>(`/leaderboard/miner/${encodeURIComponent(hotkey)}`),
   myHotkey: () => fetchJson<{ hotkey: string | null; coldkey: string | null; configured: boolean }>("/leaderboard/my-hotkey"),
   tuneAnalyze: (template: string, rounds = 30, sync = false) =>
-    fetchJson<TunePipelineResult>(`/tune/analyze?template=${template}&rounds=${rounds}&sync=${sync}`),
+    fetchJson<TunePipelineResult>(
+      `/tune/analyze?template=${template}&rounds=${rounds}&sync=${sync}&use_llm=false`,
+    ),
+  tuneLlmJudge: (payload: {
+    template: string;
+    current_config: { params: Record<string, unknown> };
+    diagnosis: TunePipelineResult["diagnosis"];
+    rule_recommendations: TuneRecommendation[];
+    top_miner_summary: TunePipelineResult["top_miner_analysis"]["summary"];
+    my_performance: TunePipelineResult["my_performance"];
+    last_update_analysis: TunePipelineResult["last_update_analysis"];
+    region_analysis: TunePipelineResult["region_analysis"];
+    logs: TuneLogEntry[];
+  }) =>
+    fetchJson<{
+      recommendations: TuneRecommendation[];
+      llm_advisory: LlmTuneAdvisory;
+      rule_recommendation_count: number;
+      proposed_config: TunePipelineResult["proposed_config"];
+      logs: TuneLogEntry[];
+    }>("/tune/llm-judge", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  tuneLlmStatus: () =>
+    fetchJson<{ configured: boolean; enabled: boolean; model: string; provider: string }>("/tune/llm-status"),
   tuneApply: (template: string, recommendations: TuneRecommendation[]) =>
     fetchJson<{ message: string; changed_params: string[]; content: string }>("/tune/apply", {
       method: "POST",

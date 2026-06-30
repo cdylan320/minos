@@ -96,3 +96,23 @@ API routes (local lab backend):
 | `GET /api/leaderboard/analytics?sync=true` | Win counts & performance stats |
 | `GET /api/leaderboard/miner/{hotkey}` | Per-miner history |
 | `POST /api/leaderboard/sync` | Refresh cache from platform |
+| `GET /api/tune/analyze` | Tune pipeline — diagnosis + recommendations |
+| `GET /api/tune/llm-status` | OpenRouter LLM layer status |
+| `POST /api/tune/apply` | Apply selected tune recommendations |
+
+## Tune pipeline (rules + optional LLM)
+
+The **Tune Pipeline** tab runs in two stages:
+
+1. **Rule engine (always, free)** — runs on open / "Run tune pipeline". Score gaps, rollback, heuristics.
+2. **LLM judge (on-demand, costs OpenRouter credits)** — click **LLM judge** after rules run to rank recommendations.
+
+Add to `.env`:
+
+```bash
+OPENROUTER_API_KEY=sk-or-v1-your-key-here
+OPENROUTER_MODEL=anthropic/claude-sonnet-4
+TUNE_LLM_ENABLED=true
+```
+
+Default model: **Claude Sonnet 4**. Restart Local Lab after editing `.env`.
