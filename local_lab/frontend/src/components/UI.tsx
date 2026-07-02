@@ -65,7 +65,8 @@ export function PipelineStepper({ activeStep }: { activeStep: number }) {
     { id: 2, title: "Configure", desc: "Tune tool params" },
     { id: 3, title: "Demo run", desc: "Sandbox variant call" },
     { id: 4, title: "Results", desc: "Review VCF output" },
-    { id: 5, title: "Deploy", desc: "Go live on SN107" },
+    { id: 5, title: "Local eval", desc: "Validator-parity score" },
+    { id: 6, title: "Deploy", desc: "Go live on SN107" },
   ];
   return (
     <div className="pipeline">

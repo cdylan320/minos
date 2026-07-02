@@ -16,8 +16,10 @@ import {
   IconRefresh,
   IconResults,
   IconTune,
+  IconEval,
 } from "./components/Icons";
 import { LeaderboardPanel } from "./components/LeaderboardPanel";
+import { LocalEvalPanel } from "./components/LocalEvalPanel";
 import { TunePanel } from "./components/TunePanel";
 import {
   Button,
@@ -28,7 +30,7 @@ import {
   TemplateSelect,
 } from "./components/UI";
 
-type Tab = "overview" | "config" | "tune" | "run" | "results" | "leaderboard";
+type Tab = "overview" | "config" | "tune" | "run" | "results" | "localeval" | "leaderboard";
 
 const NAV: { id: Tab; label: string; desc: string; icon: ReactNode }[] = [
   { id: "overview", label: "Overview", desc: "System health & setup", icon: <IconOverview /> },
@@ -36,6 +38,7 @@ const NAV: { id: Tab; label: string; desc: string; icon: ReactNode }[] = [
   { id: "tune", label: "Tune Pipeline", desc: "Score-driven tuning", icon: <IconTune /> },
   { id: "run", label: "Demo Run", desc: "Live pipeline test", icon: <IconPlay /> },
   { id: "results", label: "Results", desc: "VCF output", icon: <IconResults /> },
+  { id: "localeval", label: "Local Eval", desc: "Validator-parity scoring", icon: <IconEval /> },
   { id: "leaderboard", label: "Leaderboard", desc: "Rankings & analytics", icon: <IconLeaderboard /> },
 ];
 
@@ -168,12 +171,13 @@ export default function App() {
   const passPct = health ? (health.summary.passed / health.summary.total) * 100 : 0;
   const ready = failedCount === 0;
   const pipelineStep = useMemo(() => {
+    if (tab === "localeval") return 6;
     if (results?.found) return 5;
     if (activeRun?.demo_complete || activeRun?.status === "completed") return 4;
     if (loading || activeRun?.status === "running") return 3;
     if (configDirty) return 2;
     return ready ? 2 : 1;
-  }, [results, activeRun, loading, configDirty, ready]);
+  }, [results, activeRun, loading, configDirty, ready, tab]);
 
   const grouped = health ? groupChecks(health.checks) : [];
   const failedChecks = health?.checks.filter((c) => c.status === "fail") ?? [];
@@ -372,6 +376,10 @@ export default function App() {
             onConfigApplied={() => loadConfig(template)}
             onRunDemo={() => { setTab("run"); startDemo(); }}
           />
+        )}
+
+        {tab === "localeval" && (
+          <LocalEvalPanel template={template} />
         )}
 
         {tab === "run" && (

@@ -119,3 +119,13 @@ export function IconTune() {
     </svg>
   );
 }
+
+export function IconEval() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" aria-hidden>
+      <path d="M3 14V8M7 14V4M11 14V10M15 14V6" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+      <circle cx="14" cy="4" r="2.5" stroke="currentColor" strokeWidth="1.3" />
+      <path d="M13 4l1.5 1.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+    </svg>
+  );
+}

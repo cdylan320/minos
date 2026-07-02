@@ -1,0 +1,24 @@
+{
+  "version": "1",
+  "description": "Local eval task catalog — same scoring inputs as production validators (BAM + truth + mutations VCF + region).",
+  "tasks": [
+    {
+      "id": "demo_sandbox",
+      "name": "Platform Demo Sandbox",
+      "description": "Static demo BAM region from /v2/demo/* (chr20, ~99 synthetic mutations). Use after a demo run or download the full task bundle.",
+      "region": "chr20:46254744-51254744",
+      "chrom": "chr20",
+      "num_mutations": 99,
+      "source": "builtin",
+      "files_base_url": "https://api.theminos.ai/reference/eval/demo_sandbox",
+      "files": {
+        "bam": "round.bam",
+        "bam_index": "round.bam.bai",
+        "truth_vcf": "truth.vcf.gz",
+        "truth_vcf_index": "truth.vcf.gz.tbi",
+        "mutations_vcf": "mutations.vcf.gz",
+        "mutations_vcf_index": "mutations.vcf.gz.tbi"
+      }
+    }
+  ]
+}

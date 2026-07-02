@@ -303,6 +303,72 @@ export type VcfSummary = {
   }>;
 };
 
+export type EvalTask = {
+  id: string;
+  name: string;
+  description?: string;
+  source: string;
+  region?: string;
+  chrom?: string;
+  ready: boolean;
+  bam_only?: boolean;
+  missing_artifacts?: string[];
+  num_mutations?: number;
+  round_id?: string;
+  score_only?: boolean;
+  has_vcf?: boolean;
+  truth_source?: string;
+  synthetic_mutations?: number;
+  paths?: Record<string, string | null>;
+};
+
+export type EvalPrerequisites = {
+  ok: boolean;
+  task_id: string;
+  region?: string;
+  chrom?: string;
+  checks: Check[];
+  error?: string;
+};
+
+export type EvalScoreResult = {
+  combined_final: number;
+  snp_final: number;
+  indel_final: number;
+  advanced_score: number;
+  components?: Record<string, unknown>;
+  metrics?: Record<string, number>;
+  region?: string;
+};
+
+export type EvalRunRecord = {
+  id: string;
+  task_id: string;
+  template: string;
+  mode: string;
+  status: string;
+  created_at: string;
+  started_at?: string;
+  finished_at?: string;
+  message: string;
+  result?: EvalScoreResult;
+};
+
+export type EvalHistoryEntry = {
+  id: string;
+  timestamp: string;
+  task_id: string;
+  task_name?: string;
+  template: string;
+  mode: string;
+  config_fingerprint: string;
+  combined_final: number;
+  snp_final: number;
+  indel_final: number;
+  advanced_score: number;
+  metrics_summary?: Record<string, number>;
+};
+
 export const api = {
   meta: () => fetchJson<{ name: string; official_dashboard: string }>("/meta"),
   health: (template: string) => fetchJson<HealthReport>(`/health?template=${template}`),
@@ -392,7 +458,81 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ template, recommendations }),
     }),
+  evalTasks: (refresh = true) =>
+    fetchJson<{ tasks: EvalTask[]; ready_count: number; total_count: number }>(
+      `/eval/tasks?refresh=${refresh}`,
+    ),
+  evalScanCache: () =>
+    fetchJson<{ imported: number; scoring_cache: number; miner_downloads: number; tasks: { tasks: EvalTask[] } }>(
+      "/eval/tasks/scan-cache",
+      { method: "POST" },
+    ),
+  evalFetchDemo: () =>
+    fetchJson<{ task: EvalTask; log: string[]; ready: boolean; message: string }>(
+      "/eval/tasks/fetch-demo",
+      { method: "POST" },
+    ),
+  evalGenerateTruth: (taskId: string, force = false) =>
+    fetchJson<{ task: EvalTask; log: string[]; cached: boolean; message: string }>(
+      `/eval/tasks/generate-truth?task_id=${encodeURIComponent(taskId)}&force=${force}`,
+      { method: "POST" },
+    ),
+  evalDownloadSdf: (chrom = "chr20") =>
+    fetchJson<{ ok: boolean; chrom: string; message?: string; downloaded: string[] }>(
+      `/eval/prerequisites/download-sdf?chrom=${chrom}`,
+      { method: "POST" },
+    ),
+  evalAttachTruth: (taskId: string, truthVcf: string, mutationsVcf: string) =>
+    fetchJson<{ task: EvalTask }>("/eval/tasks/attach-truth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId, truth_vcf: truthVcf, mutations_vcf: mutationsVcf }),
+    }),
+  evalPrepare: (taskId: string) =>
+    fetchJson<{ task: EvalTask; log: string[] }>("/eval/tasks/prepare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ task_id: taskId }),
+    }),
+  evalFetchPlatform: (roundId: string) =>
+    fetchJson<{ task: EvalTask }>("/eval/tasks/fetch-platform", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ round_id: roundId }),
+    }),
+  evalImport: (sourceDir: string, name?: string) =>
+    fetchJson<{ task: EvalTask }>("/eval/tasks/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source_dir: sourceDir, name }),
+    }),
+  evalPrerequisites: (taskId: string) =>
+    fetchJson<EvalPrerequisites>(`/eval/prerequisites?task_id=${encodeURIComponent(taskId)}`),
+  evalRun: (payload: { task_id: string; template: string; mode: "full" | "score_only"; query_vcf?: string }) =>
+    fetchJson<EvalRunRecord>("/eval/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  evalRuns: () => fetchJson<{ runs: EvalRunRecord[] }>("/eval/runs"),
+  evalLatest: () => fetchJson<{ found: boolean; message?: string } & Partial<EvalScoreResult>>("/eval/latest"),
+  evalHistory: (limit = 30) =>
+    fetchJson<{ entries: EvalHistoryEntry[]; count: number }>(`/eval/history?limit=${limit}`),
 };
+
+export function streamEvalLogs(runId: string, onLine: (line: string) => void, onDone: () => void) {
+  const source = new EventSource(`${API}/eval/runs/${runId}/logs`);
+  source.onmessage = (ev) => onLine(ev.data);
+  source.addEventListener("done", () => {
+    source.close();
+    onDone();
+  });
+  source.onerror = () => {
+    source.close();
+    onDone();
+  };
+  return source;
+}
 
 export function streamLogs(runId: string, onLine: (line: string) => void, onDone: () => void) {
   const source = new EventSource(`${API}/runs/${runId}/logs`);
