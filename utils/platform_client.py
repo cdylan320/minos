@@ -155,9 +155,9 @@ class PlatformClient:
     ) -> Optional[Dict[str, Any]]:
         """Fetch stake-weighted canonical ranking for a round.
 
-        Used by validator weight tracking as a tiebreak signal when local EMA
-        leaders are close. Returns the full response including the ranked list of
-        ``{miner_hotkey, consensus_ema, validator_count, stake_share}``.
+        Used by validator weight tracking as a tiebreak signal when local
+        current-round leaders are close. Returns the full response including a
+        ranked list with ``miner_hotkey`` and validator coverage metadata.
 
         Platform serves this only after the late-score grace period. Returns
         ``None`` on any error; the validator treats that as canonical
@@ -335,11 +335,11 @@ class ValidatorPlatformClient(PlatformClient):
     # =========================================================================
 
     async def get_validator_state(self) -> Dict[str, Any]:
-        """Get validator state for restart recovery (EMA scores, round history, scored rounds).
+        """Get validator state for restart recovery.
 
         Returns:
             Dict containing:
-                - ema_scores: List of {miner_hotkey, ema_score, participation_count, eligible}
+                - ema_scores: Legacy platform score entries; ignored by round-only scoring
                 - round_history: List of {round_id, scored_hotkeys}
                 - scored_round_ids: List of round_id strings
         """
@@ -849,7 +849,7 @@ class ValidatorPlatformClient(PlatformClient):
         validator_hotkey: str,
         entries: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Submit weight history (EMA scores, ranks, weights) for a round.
+        """Submit weight history for a round.
 
         Called after computing validator weights so the platform
         can display historical scoring data on the dashboard.
@@ -859,7 +859,8 @@ class ValidatorPlatformClient(PlatformClient):
             validator_hotkey: The validator's hotkey.
             entries: List of per-miner dicts with keys:
                      miner_hotkey, raw_score, ema_score, rank, weight,
-                     eligible, participation_count.
+                     eligible, participation_count. ``ema_score`` is retained
+                     as a legacy schema field and is empty for round-only scoring.
 
         Returns:
             Dict with success status and stored count.

@@ -24,6 +24,7 @@ Minos (SN107) is a subnet for genomic variant calling and benchmarking powered b
 - [Repository Layout](#repository-layout)
 - [System Prerequisites](#system-prerequisites)
 - [Quick Start](#quick-start)
+- [Optional Minos Miner AI Assistant](#optional-minos-miner-ai-assistant)
 - [Running with PM2 (optional)](#running-with-pm2-optional)
 - [Validator Setup](#validator-setup)
 - [Miner Setup](#miner-setup)
@@ -104,10 +105,15 @@ minos_subnet/
 ├── docs/                     # Architecture and integration docs
 │   ├── architecture.md       # System architecture deep dive
 │   ├── tuning_guide.md       # Miner tuning reference (scoring, parameters, strategy)
-│   └── hap_py_docker.md      # hap.py Docker image reference
+│   ├── hap_py_docker.md      # hap.py Docker image reference
+│   └── ai-assistant/         # AI assistant knowledge graph, runtime skills, and persona assets
 ├── scripts/                  # Developer tools
 │   ├── verify.sh             # Pre-flight environment check
 │   ├── demo.sh               # End-to-end demo runner
+│   ├── minosvm_first_run.sh  # Friendly MinosVM first-run launcher
+│   ├── prompt_ai_assistant.sh # First-run Ditto/OpenClaw/Hermes prompt
+│   ├── setup_ditto_agent.sh  # Optional Ditto @minos graph subscription
+│   ├── setup_ai_assistant.sh # Optional Ditto + Minos MCP + OpenClaw/Hermes setup
 │   └── auto_update.sh        # PM2 auto-update worker used by enable_auto_update.sh
 ├── tests/                    # Unit and integration tests
 │   ├── conftest.py
@@ -156,7 +162,9 @@ bash start-miner.sh      # Start as miner (choose one)
 bash start-validator.sh  # Start as validator (choose one)
 ```
 
-The `start-*.sh` scripts handle wallet setup on first run — no manual `.env` editing needed. Run with `--help` to see all options, or `--setup` to re-run the setup wizard. If you already ran `install.sh` before, running it again will only update dependencies and download any new reference data (use `--fresh` to redo everything).
+The `start-*.sh` scripts handle wallet setup on first run and automatically repair missing required runtime assets before launch, including reference data and Docker images. Run with `--help` to see all options, or `--setup` to re-run the setup wizard. If you already ran `install.sh` before, running it again will only update dependencies and download any new reference data (use `--fresh` to redo everything).
+
+The installer automatically installs required runtime pieces where supported, including Python packages, Docker on Linux, Node/npm for PM2, missing Docker images, and reference data. It only pauses for choices that should stay under your control, such as wallet/registration, existing `.env` overwrite, and optional AI assistant/runtime setup.
 
 ### Try mining without registering
 
@@ -173,13 +181,81 @@ In demo mode the miner skips the chain entirely, generates an ephemeral keypair,
 
 **Switching from demo to live**: the demo run creates a template `.env` with `MINER_DEMO=true` and placeholder `WALLET_NAME=default` / `WALLET_HOTKEY=default`. To switch to real mining: edit `.env` to set your real wallet name/hotkey, change `MINER_DEMO=true` → `MINER_DEMO=false` (or delete the line), and re-run `bash start-miner.sh`. Alternatively, run `bash start-miner.sh --setup` to redo the wallet wizard.
 
-**MinosVM:** If using the MinosVM Docker image, everything is pre-installed. Just SSH in and run `bash start-miner.sh` or `bash start-validator.sh`.
+**MinosVM:** If using the MinosVM image, everything is pre-installed. Just SSH in and run:
+
+```bash
+bash scripts/minosvm_first_run.sh
+```
+
+The MinosVM first-run menu can start a demo miner, set up live mining, set up a validator, or launch the Minos Miner AI Assistant flow. You can still run `bash start-miner.sh` or `bash start-validator.sh` directly.
+
+### Optional Minos Miner AI Assistant
+
+Minos includes an optional miner onboarding assistant so new miners can ask Minos-specific questions from a local runtime instead of starting with a blank generic agent. The assistant helps with demo mode, PM2/Docker issues, scoring/eligibility, public endpoint checks, safe paste-back rules, variant-calling concepts, and basic config-tuning.
+
+The general setup menu offers:
+
+1. OpenClaw runtime with Ditto skill, Minos MCP live data, and local Minos skill/persona files. This is the recommended path.
+2. Hermes runtime with Ditto skill, Minos MCP live data, and local Minos skill/persona files.
+3. Ditto account setup only, subscribed read-only to the public `@minos` knowledge graph.
+4. Skip for now.
+
+On MinosVM, Ditto is baseline infrastructure and the first-run prompt only asks whether to enable OpenClaw, enable Hermes, or skip the local runtime.
+
+During a fresh miner install, `bash install.sh` offers to set this up after the setup wizard finishes. You can also subscribe Ditto to the public `@minos` graph later:
+
+```bash
+bash start-miner.sh --setup-ditto
+# or directly:
+bash scripts/setup_ditto_agent.sh
+```
+
+If you also want a local agent runtime, use the guided AI assistant setup:
+
+```bash
+bash start-miner.sh --setup-ai-assistant
+# or directly:
+bash scripts/setup_ai_assistant.sh
+```
+
+That flow defaults to OpenClaw because it gives miners a local runtime plus the `@minos` graph and Minos MCP live data from `https://mcp.theminos.ai`. If you choose OpenClaw or Hermes from the menu, it installs that runtime's Ditto skill, configures the `minos` MCP connection for current round/leaderboard/miner-history data, and installs a local `minos-miner` skill/persona bundle so the agent understands Minos setup, monitoring, variant calling, public endpoints, and safe tuning even before a Ditto lookup. OpenClaw and Hermes are installed noninteractively by default, so miners stay inside the Minos setup flow. Ditto-only remains available outside MinosVM for miners who only want the public graph subscription and no local runtime yet.
+
+OpenClaw/Hermes still need a model provider. For 1.0.0, Minos does not install or tune local open-source models. During setup, Minos checks whether the selected runtime already has a usable provider; if not, it offers a short provider menu. OpenClaw users can choose OpenAI/Codex, Claude/Anthropic, OpenRouter, OpenClaw guided setup, or skip. Hermes users can choose Hermes/Nous Portal, full Hermes setup, or skip. Provider credentials stay inside OpenClaw, Hermes, or the provider OAuth flow; Minos does not read, log, or store model API keys.
+
+The setup script uses the Ditto CLI to initialize or use your Ditto account, then subscribes it read-only to the public `@minos` knowledge graph. The launch graph is `Minos SN107 Public Knowledge Graph` version `1.0.0`, and subscribed search results should show `subscribed_graph:minos-public-knowledge-graph-1.0.0` with `@minos / Minos SN107 - ...` source context. On MinosVM, the default is public-graph-only: private fallback seeding is disabled unless explicitly overridden. Outside MinosVM, the script can save the same public memory-pack files into that Ditto account as a private fallback copy only if graph subscription/search cannot be verified or fallback seeding is explicitly requested. That fallback is only public Minos docs, never miner secrets, and the preferred source remains the shared `@minos` graph. If you choose OpenClaw or Hermes, setup installs the `heyditto` command globally so runtime skills can read Ditto knowledge directly. It also writes the Ditto API key into the runtime's own env file without printing it: `~/.openclaw/.env` for OpenClaw and `~/.hermes/.env` for Hermes. If you do not already have Ditto CLI auth, it creates a Ditto agent account, prints the private claim URL at the end of setup, and saves the same URL locally with private file permissions. Open that claim URL yourself and do not paste it into public channels, screenshots, or logs before claiming it. The setup does **not** upload your Minos `.env`, wallet files, miner configs, logs, presigned URLs, model API keys, or private validator data.
+
+Minos MCP is configured only for public live subnet tools such as current round, leaderboard, recent rounds, miner history, subnet overview, incentives, and emissions. Ditto explains stable setup and troubleshooting concepts; MCP provides current subnet data.
+
+For OpenClaw on headless/container VMs, Minos runs the foreground gateway under PM2 as `openclaw-gateway` because `systemctl --user` is often unavailable. Check it with `openclaw gateway status` or `pm2 logs openclaw-gateway --lines 80`. Start the local OpenClaw terminal UI with `bash scripts/openclaw-tui.sh`; the wrapper reads the local gateway token without printing it so miners do not hit an extra pairing prompt.
+
+Requirements: Ditto setup needs either `heyditto` or Node/npm for `npx -y @heyditto/cli`. `bash install.sh` installs Node/npm where supported. OpenClaw/Hermes are only needed if you choose a runtime. They still need a model provider configured in that runtime. The recommended assistant path is:
+
+```bash
+bash scripts/setup_ai_assistant.sh --with-ditto --openclaw
+```
+
+Advanced runtime flags such as `--openclaw`, `--hermes`, `--skip-ditto`, and `--dry-run` are available on `scripts/setup_ai_assistant.sh` directly.
+
+If OpenClaw or Hermes says it cannot use Ditto because `heyditto` is missing or `DITTO_API_KEY` is not configured, rerun the matching setup:
+
+```bash
+bash scripts/setup_ai_assistant.sh --with-ditto --openclaw
+bash scripts/setup_ai_assistant.sh --with-ditto --hermes
+```
+
+After setup, try asking Ditto:
+
+```text
+PM2 says my Minos miner is online but I have 0 weight. What should I check?
+```
+
+In normal operation, agents subscribe to the shared public `@minos` graph. Private fallback seeding is only for cases where graph retrieval cannot be verified or the operator explicitly requests a local fallback copy.
 
 ### Running with PM2 (optional)
 
 [PM2](https://pm2.keymetrics.io/) keeps the miner or validator running with restarts and log management. This repo runs the same **`start-miner.sh`** / **`start-validator.sh`** entrypoints under PM2 (so your venv, `.env`, and prerequisite checks stay identical to a manual start).
 
-1. **Install PM2** — **`bash install.sh`** runs **`npm install -g pm2`** automatically when **`npm`** is on your `PATH`. If **`npm`** is missing, install Node.js and run **`npm install -g pm2`** once.
+1. **Install PM2** — **`bash install.sh`** installs or repairs Node.js/npm, then runs **`npm install -g pm2`** automatically. If PM2 installs under an npm global directory that is not on `PATH`, the installer prints the exact `export PATH=...` line to add.
 2. **Create `.env` first** — Run **`bash start-validator.sh`** or **`bash start-miner.sh`** once in a normal terminal so wallet/setup can run (PM2 does not provide a TTY for the interactive wizard).
 3. **Launch under PM2:**
 
@@ -195,7 +271,7 @@ pm2 start ecosystem.validator.config.js
 pm2 start ecosystem.miner.config.js
 ```
 
-Useful commands: **`pm2 status`**, **`pm2 logs minos-validator`** / **`pm2 logs minos-miner`**, **`pm2 save`** (persist process list after reboot — pair with **`pm2 startup`** per PM2 docs). The interactive setup wizard can also generate **`ecosystem.<role>.config.js`** when you choose the PM2 process-manager option.
+Useful commands: **`pm2 status`**, **`pm2 logs minos-validator`** / **`pm2 logs minos-miner`**, **`pm2 save`** (persist process list after reboot — pair with **`pm2 startup`** per PM2 docs). The interactive setup wizard auto-generates **`ecosystem.<role>.config.js`** when PM2 is available. Demo or registered nodes are started automatically; unregistered live nodes are registered in PM2 but left stopped until you register the hotkey.
 
 ### Automatic Updates with PM2
 
@@ -263,7 +339,7 @@ docker pull quay.io/biocontainers/samtools:1.20--h50ea8bc_0
 # docker pull staphb/freebayes:1.3.7
 ```
 
-> **Note:** The hap.py image is pinned by SHA256 digest for reproducible scoring. The tag `genonet/hap-py:0.3.15` points to the same image but the digest is what validators use internally.
+> **Note:** The hap.py image is pinned by SHA256 digest for reproducible scoring. The tag `genonet/hap-py:0.3.15` points to the same image, but validators use the pinned digest for consistency.
 
 #### 4. Run Setup Wizard
 
@@ -491,7 +567,7 @@ Eligibility requires scoring in at least 10 of the last 20 rounds, including the
 | `No miners available`         | No registered miners                       | Check metagraph for active miners                                                                                |
 | `hap.py zero scores`          | VCF format issues                          | Ensure single-sample VCF output                                                                                  |
 | Round skipped, "<10min left"  | Submitted too late                         | Miner needs ≥10 min remaining to start a round. Check clock skew (`timedatectl`) and platform connectivity speed |
-| Reference download stuck/slow | Platform redirect or transient network     | Setup retries once automatically. If it still fails, re-run `bash install.sh --update-only`                      |
+| Reference download stuck/slow | Platform redirect or transient network     | Setup retries once automatically. If it still fails, re-run `python setup.py --update-data-only`                 |
 | Validator: "no scoring rounds"| Round still in submission window           | Validators only score AFTER the submission window closes. Wait for the next tempo boundary                       |
 | Earning 0 weight as miner     | Not eligible yet, no valid current score, or outside the top current-round winners | Need >=10 of last 20 rounds participated, then a stronger current-round Advanced Score. See [tuning_guide](docs/tuning_guide.md) |
 
@@ -529,9 +605,15 @@ btcli subnet metagraph --netuid 107
 - [docs/architecture.md](docs/architecture.md) - System architecture deep dive
 - [docs/tuning_guide.md](docs/tuning_guide.md) - Miner tuning guide (scoring breakdown, parameters, strategy)
 - [docs/hap_py_docker.md](docs/hap_py_docker.md) - hap.py Docker image reference
+- [docs/ai-assistant/memory-pack/README.md](docs/ai-assistant/memory-pack/README.md) - Public Minos SN107 knowledge source for Ditto and agent runtimes
+- [docs/ai-assistant/README.md](docs/ai-assistant/README.md) - OpenClaw/Hermes local skill, persona, and model setup assets
 - [scripts/verify.sh](scripts/verify.sh) - Pre-flight environment check (`bash scripts/verify.sh --miner`)
 - [scripts/demo.sh](scripts/demo.sh) - Run a single demo round end-to-end (`bash scripts/demo.sh`)
 - [local_lab/README.md](local_lab/README.md) - **Local Lab** — web UI + API for miner testing (`bash local_lab/start-lab.sh`)
+- [scripts/minosvm_first_run.sh](scripts/minosvm_first_run.sh) - Friendly MinosVM first-run menu
+- [scripts/prompt_ai_assistant.sh](scripts/prompt_ai_assistant.sh) - One-time AI assistant prompt for installs and VM first run
+- [scripts/setup_ditto_agent.sh](scripts/setup_ditto_agent.sh) - Subscribe Ditto to the public `@minos` knowledge graph
+- [scripts/setup_ai_assistant.sh](scripts/setup_ai_assistant.sh) - Set up Ditto first, then optionally connect OpenClaw or Hermes
 
 ---
 

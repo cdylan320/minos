@@ -173,10 +173,8 @@ class Validator:
             )
             bt.logging.info("Continuing in demo/unregistered mode — scoring will still run but weights cannot be set")
 
-        self.score_tracker = ScoreTracker(
-            alpha=GENOMICS_CONFIG["ema_alpha"],
-        )
-        bt.logging.info("Score tracker initialized (round-only winner policy; EMA disabled)")
+        self.score_tracker = ScoreTracker()
+        bt.logging.info("Score tracker initialized (round-only winner policy)")
 
         self.setup_genomics_components()
         self.setup_platform_client()
@@ -593,7 +591,7 @@ class Validator:
     def _score_tracker_snapshot(self) -> dict:
         """Capture ScoreTracker state before applying a round."""
         return {
-            "ema_scores": dict(self.score_tracker.ema_scores),
+            "round_scores": dict(self.score_tracker.round_scores),
             "last_raw_scores": dict(self.score_tracker.last_raw_scores),
             "round_history": deepcopy(self.score_tracker.round_history),
             "participation_counts": dict(self.score_tracker._participation_counts),
@@ -602,7 +600,7 @@ class Validator:
 
     def _restore_score_tracker(self, snapshot: dict):
         """Restore ScoreTracker state after an unfinalized round."""
-        self.score_tracker.ema_scores = dict(snapshot["ema_scores"])
+        self.score_tracker.round_scores = dict(snapshot["round_scores"])
         self.score_tracker.last_raw_scores = dict(snapshot["last_raw_scores"])
         self.score_tracker.round_history = deepcopy(snapshot["round_history"])
         self.score_tracker._participation_counts = defaultdict(
@@ -1095,7 +1093,7 @@ class Validator:
         # This must happen after backfill so only miners with a valid local or
         # peer score participate in this round's ranking.
         if not all_scored_hotkeys:
-            self.score_tracker.ema_scores.clear()
+            self.score_tracker.round_scores.clear()
             self.score_tracker.last_raw_scores.clear()
             bt.logging.error(
                 f"Round {round_id}: no valid local or backfill scores; "
@@ -1304,7 +1302,7 @@ class Validator:
         """
         try:
             # Compute weights over the miners finalized for this round.
-            tracked_miners = list(self.score_tracker.ema_scores.keys())
+            tracked_miners = list(self.score_tracker.round_scores.keys())
             if not tracked_miners:
                 bt.logging.info("No miners scored — skipping weight assignment")
                 return False
@@ -1434,7 +1432,7 @@ class Validator:
             positive_dropped = [
                 hk
                 for hk in dropped_tracked
-                if self.score_tracker.ema_scores.get(hk, 0.0) > 0
+                if self.score_tracker.round_scores.get(hk, 0.0) > 0
             ]
             if positive_dropped:
                 sample = ", ".join(hk[:16] for hk in positive_dropped[:5])
@@ -1552,7 +1550,7 @@ class Validator:
                         hk
                         for hk in chain_eligible_tracked_miners
                         if self.score_tracker.is_eligible(hk)
-                        and self.score_tracker.ema_scores.get(hk, 0.0) > 0
+                        and self.score_tracker.round_scores.get(hk, 0.0) > 0
                     }
                     if not any(hk in local_eligible_positive for hk in canonical_ranking):
                         bt.logging.error(
@@ -1596,7 +1594,7 @@ class Validator:
             if recipients:
                 for r_hk in recipients:
                     r_w = weights[r_hk]
-                    r_score = self.score_tracker.ema_scores.get(r_hk, 0)
+                    r_score = self.score_tracker.round_scores.get(r_hk, 0)
                     print(f"   {r_hk[:16]}... score={r_score:.4f} weight={r_w:.6f}", flush=True)
             else:
                 print(f"   No recipients — weights submission skipped (fail-closed)", flush=True)
@@ -1882,7 +1880,7 @@ class Validator:
                 print(f"   Platform connection error: {e} - falling back to standalone mode", flush=True)
                 self.use_platform = False
 
-        # Restart recovery: platform may return legacy EMA/history payloads,
+        # Restart recovery: platform may return legacy score/history payloads,
         # but the round-only tracker starts fresh by design.
         if self.use_platform and self.platform_client:
             try:
@@ -1890,7 +1888,7 @@ class Validator:
                 state = await self.platform_client.get_validator_state()
 
                 self.score_tracker.recover_from_platform_state(
-                    ema_entries=state.get("ema_scores", []),
+                    legacy_score_entries=state.get("ema_scores", []),
                     round_history=state.get("round_history", []),
                 )
                 self.scored_rounds = set(state.get("scored_round_ids", []))

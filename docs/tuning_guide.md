@@ -30,7 +30,7 @@ Validators compare your VCF output against a truth VCF using **hap.py** (the GA4
 The AdvancedScorer outputs a raw score on a 0–100 scale. Validators normalize that to a 0–1 current-round score, so a raw score of 85/100 becomes 0.85. Miner rankings are round-only: each round is a separate challenge, and the current-round score decides the paid ranks for that round.
 
 - A single bad round costs that round, not future rounds.
-- There is no EMA decay for missed rounds in the current scoring path.
+- There is no historical-score decay or carryover in the current scoring path.
 - Eligibility still depends on recent participation: miners must have valid positive scores in at least 10 of the last 20 rounds.
 - When reading logs: `Score: 85.00/100` means the current-round score is 0.85 after normalization.
 

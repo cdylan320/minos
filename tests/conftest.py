@@ -16,14 +16,14 @@ def fixtures_dir():
 def score_tracker():
     """Fresh ScoreTracker with default settings."""
     from utils.weight_tracking import ScoreTracker
-    return ScoreTracker(alpha=0.1, min_rounds=10, decay_factor=0.95)
+    return ScoreTracker(min_rounds=10)
 
 
 @pytest.fixture
 def score_tracker_low_threshold():
     """ScoreTracker with low eligibility threshold for faster tests."""
     from utils.weight_tracking import ScoreTracker
-    return ScoreTracker(alpha=0.1, min_rounds=2, decay_factor=0.95)
+    return ScoreTracker(min_rounds=2)
 
 
 @pytest.fixture

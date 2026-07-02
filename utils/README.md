@@ -60,7 +60,7 @@ score = AdvancedScorer.compute_advanced_score(results)
 ```python
 from utils import ScoreTracker
 
-tracker = ScoreTracker(alpha=0.1)
+tracker = ScoreTracker()
 
 # Update a miner's score
 tracker.update(hotkey="5xxx...", raw_score=0.92)

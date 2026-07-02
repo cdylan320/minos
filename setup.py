@@ -26,10 +26,21 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Callable
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 
 # ── Bootstrap: ensure rich + questionary are available ────────────────────────
+
+def _print_help():
+    print(__doc__.strip())
+    print("\nOptions:")
+    print("  --update-data-only   Refresh Docker images/reference data without the full wizard")
+    print("  --help, -h           Show this help")
+
+
+if any(arg in ("--help", "-h") for arg in sys.argv[1:]):
+    _print_help()
+    sys.exit(0)
+
 
 def _bootstrap_deps():
     """Install rich and questionary if missing."""
@@ -45,20 +56,17 @@ def _bootstrap_deps():
 
     if missing:
         print(f"\nSetup wizard requires: {', '.join(missing)}")
-        if "--update-data-only" in sys.argv:
-            print("Installing automatically for --update-data-only...")
+        print("Installing automatically...")
+        try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", *missing, "--quiet"]
             )
-        else:
-            answer = input("Install now? [Y/n] ").strip().lower()
-            if answer in ("", "y", "yes"):
-                subprocess.check_call(
-                    [sys.executable, "-m", "pip", "install", *missing, "--quiet"]
-                )
-            else:
-                print("Cannot proceed without dependencies. Exiting.")
-                sys.exit(1)
+        except subprocess.CalledProcessError:
+            print("\nCould not install setup wizard dependencies into this Python environment.")
+            print("Recommended fix:")
+            print("  bash install.sh")
+            print("\nOr create a virtual environment manually, activate it, then re-run setup.py.")
+            sys.exit(1)
 
 _bootstrap_deps()
 
@@ -68,7 +76,6 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from rich.align import Align
-from rich.rule import Rule
 import questionary
 from questionary import Style as QStyle
 
@@ -256,10 +263,7 @@ class SetupWizard:
             total = len(self.steps)
             for i, (name, fn) in enumerate(self.steps):
                 self.console.print()
-                self.console.print(Rule(
-                    f"[bold cyan]Step {i + 1} of {total} -- {name}[/]",
-                    style="cyan",
-                ))
+                self._print_step_header(i + 1, total, name)
                 self.console.print()
 
                 result = fn()
@@ -280,12 +284,104 @@ class SetupWizard:
             self.console.print("\n\n  [yellow]Setup interrupted. Run again to resume.[/]")
             sys.exit(0)
 
+        self._prompt_ai_assistant_if_applicable()
         self.console.print()
         self.console.print(Panel(
-            "[bold green]Setup complete![/]\n\nYour Minos node is ready.",
+            "[bold green]Minos setup finished[/]\n\n"
+            "Your node is ready. Use [bold cyan]bash start-miner.sh[/] or "
+            "[bold cyan]bash pm2-miner.sh[/] to run the miner.",
             border_style="green",
             padding=(1, 2),
         ))
+        try:
+            self.console.file.flush()
+        except Exception:
+            pass
+        # Some third-party chain clients used during setup can leave non-daemon
+        # worker threads behind. At this point the wizard is finished and all
+        # files/processes have been written, so force the child process to end
+        # instead of leaving install.sh stuck after the success panel.
+        os._exit(0)
+
+    def _print_step_header(self, current: int, total: int, name: str) -> None:
+        """Print a capped-width step rule with a small progress indicator."""
+        dots = "●" * current + "○" * (total - current)
+        label = f" {dots}  Step {current} of {total} -- {name} "
+        width = min(max(self.console.width - 4, 60), 96)
+
+        if len(label) >= width:
+            line = label.strip()
+        else:
+            left = (width - len(label)) // 2
+            right = width - len(label) - left
+            line = f"{'─' * left}{label}{'─' * right}"
+
+        self.console.print(Align.center(Text(line, style="bold cyan")))
+
+    @staticmethod
+    def _status(label: str, level: str = "pass") -> str:
+        """Return a compact status label for setup tables."""
+        styles = {
+            "pass": "[green]✓ PASS[/]",
+            "warn": "[yellow]⚠ WARN[/]",
+            "fail": "[red]✗ FAIL[/]",
+            "info": "[cyan]• INFO[/]",
+            "skip": "[dim]SKIP[/]",
+        }
+        return styles.get(level, label)
+
+    def _print_command_table(self, title: str, rows: List[Tuple[str, str]]) -> None:
+        """Print command hints as a compact two-column table."""
+        table = Table(
+            title=title,
+            show_header=True,
+            header_style="bold cyan",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+        table.add_column("Command", style="bold cyan", overflow="fold")
+        table.add_column("Use", style="dim", overflow="fold")
+        for command, purpose in rows:
+            table.add_row(command, purpose)
+        self.console.print(table)
+
+    def _prompt_ai_assistant_if_applicable(self) -> None:
+        """Offer the optional miner assistant after a successful miner setup."""
+        if self.state.role != "miner" or self.state.is_demo:
+            return
+
+        prompt_script = BASE_DIR / "scripts" / "prompt_ai_assistant.sh"
+        if not prompt_script.exists():
+            self.console.print(
+                "\n  [yellow]Minos Miner AI Assistant prompt script was not found.[/]\n"
+                "  [dim]Run [bold cyan]bash start-miner.sh --setup-ai-assistant[/] after updating the repo.[/]"
+            )
+            return
+
+        prompt_marker = BASE_DIR / ".minos_ai_assistant_prompted"
+        if prompt_marker.exists():
+            self.console.print(
+                "\n  [dim]Minos Miner AI Assistant prompt was already handled. "
+                "Run [bold cyan]bash start-miner.sh --setup-ai-assistant[/] to set it up again.[/]"
+            )
+            return
+
+        self.console.print("\n  [cyan]Opening optional Minos Miner AI Assistant setup...[/]")
+        result = subprocess.call([
+            "bash",
+            str(prompt_script),
+            "--prompt",
+            "--once",
+            "--default",
+            "y",
+            "--role",
+            "miner",
+        ])
+        if result != 0:
+            self.console.print(
+                "\n  [yellow]Minos Miner AI Assistant setup did not complete.[/]\n"
+                "  [dim]Retry with [bold cyan]bash start-miner.sh --setup-ai-assistant[/].[/]"
+            )
 
     # ── Step 1: Welcome ───────────────────────────────────────────────────
 
@@ -300,11 +396,11 @@ class SetupWizard:
             "      G---C"
             "[/bold cyan]"
         )
-        self.console.print(Panel(
-            Align.center(banner),
+        self.console.print(Align.center(Panel.fit(
+            banner,
             border_style="cyan",
-            padding=(1, 2),
-        ))
+            padding=(1, 4),
+        )))
 
         self.console.print(
             "  [dim]This wizard guides you through setting up a Minos miner or validator.[/]"
@@ -312,14 +408,18 @@ class SetupWizard:
         self.console.print(
             "  [dim]Safe to run multiple times -- already-completed steps are detected and skipped.[/]"
         )
+        self.console.print(
+            "  [dim]Required Docker images and reference files download automatically; "
+            "the prompts are only for role, wallet/registration, template, and optional AI runtime.[/]"
+        )
         self.console.print()
 
         role = questionary.select(
             "What are you setting up?",
             choices=[
-                questionary.Choice("Miner     -- Run variant callers, earn TAO", value="miner"),
-                questionary.Choice("Validator  -- Score miners, set weights", value="validator"),
-                questionary.Choice("Demo miner -- Test the pipeline only (no wallet, no TAO)", value="demo-miner"),
+                questionary.Choice("Miner — Run variant callers after registration, earn TAO", value="miner"),
+                questionary.Choice("Validator — Score miners and set weights", value="validator"),
+                questionary.Choice("Demo miner — Test the pipeline only (no wallet, no TAO)", value="demo-miner"),
             ],
             style=CUSTOM_STYLE,
         ).ask()
@@ -336,22 +436,28 @@ class SetupWizard:
             self.state.is_demo = True
             self.state.wallet_name = "demo"
             self.state.wallet_hotkey = "demo"
-            self.console.print("  Selected: [bold green]Miner (demo mode)[/]")
+            self.console.print("  [green]✓[/] Role: [bold green]Demo miner[/] — test the pipeline only")
             self.console.print(
                 "  [dim]No wallet will be created; the miner uses an ephemeral "
                 "keypair against /v2/demo/* — no TAO, no scoring.[/]"
             )
         else:
             self.state.role = role
-            self.console.print(f"  Selected: [bold green]{role.capitalize()}[/]")
+            role_detail = {
+                "miner": "run variant callers and earn TAO after registration",
+                "validator": "score miners and set weights",
+            }[role]
+            self.console.print(
+                f"  [green]✓[/] Role: [bold green]{role.capitalize()}[/] — {role_detail}"
+            )
         return StepResult()
 
     # ── Step 2: System check ──────────────────────────────────────────────
 
     def step_system_check(self) -> StepResult:
-        table = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
+        table = Table(show_header=True, header_style="bold cyan", border_style="cyan", padding=(0, 1))
         table.add_column("Check", style="white", width=25)
-        table.add_column("Status", justify="center", width=8)
+        table.add_column("Status", justify="center", width=10)
         table.add_column("Details", style="dim", max_width=45)
 
         blockers = []
@@ -361,23 +467,23 @@ class SetupWizard:
         arch = platform.machine()
         self.state.os_name = os_name
         self.state.arch = arch
-        table.add_row("Operating System", "[green]PASS[/]", f"{os_name} {platform.release()} ({arch})")
+        table.add_row("Operating System", self._status("PASS"), f"{os_name} {platform.release()} ({arch})")
 
         # Python
         py = sys.version_info
         py_str = f"{py.major}.{py.minor}.{py.micro}"
         self.state.python_version = py_str
         if py >= (3, 10):
-            table.add_row("Python", "[green]PASS[/]", f"{py_str}")
+            table.add_row("Python", self._status("PASS"), f"{py_str}")
         else:
-            table.add_row("Python", "[red]FAIL[/]", f"{py_str} (need 3.10+)")
+            table.add_row("Python", self._status("FAIL", "fail"), f"{py_str} (need 3.10+)")
             blockers.append("Python 3.10+ is required")
 
         # Docker
         docker_ok, docker_detail = self._check_docker()
         self.state.docker_version = docker_detail
         if docker_ok:
-            table.add_row("Docker", "[green]PASS[/]", docker_detail)
+            table.add_row("Docker", self._status("PASS"), docker_detail)
         elif "permission denied" in docker_detail:
             # Docker is installed and daemon is running, but the docker group is not
             # active in this shell yet (happens right after install without logout).
@@ -389,14 +495,14 @@ class SetupWizard:
                 cmd_str = sys.executable + " " + shlex.join(sys.argv)
                 os.execvp("sg", ["sg", "docker", "-c", cmd_str])
                 # execvp replaces this process; we only reach here if exec failed
-            table.add_row("Docker", "[yellow]WARN[/]", docker_detail)
+            table.add_row("Docker", self._status("WARN", "warn"), docker_detail)
             blockers.append(
                 "Docker group not active in this shell.\n"
                 "    Fix: run [bold]newgrp docker[/bold] then re-run: python setup.py\n"
                 "    Or log out and back in, then re-run setup."
             )
         else:
-            table.add_row("Docker", "[red]FAIL[/]", docker_detail)
+            table.add_row("Docker", self._status("FAIL", "fail"), docker_detail)
             blockers.append("Docker is required but not available")
 
         # Disk
@@ -404,9 +510,9 @@ class SetupWizard:
         disk_free = shutil.disk_usage(BASE_DIR).free / (1024 ** 3)
         self.state.disk_free_gb = disk_free
         if disk_free >= min_disk:
-            table.add_row("Disk Space", "[green]PASS[/]", f"{disk_free:.0f} GB free ({min_disk}+ needed)")
+            table.add_row("Disk Space", self._status("PASS"), f"{disk_free:.0f} GB free ({min_disk}+ needed)")
         else:
-            table.add_row("Disk Space", "[yellow]WARN[/]", f"{disk_free:.0f} GB free ({min_disk}+ recommended)")
+            table.add_row("Disk Space", self._status("WARN", "warn"), f"{disk_free:.0f} GB free ({min_disk}+ recommended)")
 
         # RAM
         ram_gb = self._get_ram_gb()
@@ -414,17 +520,17 @@ class SetupWizard:
         min_ram = 8 if self.state.role == "miner" else 32
         if ram_gb > 0:
             if ram_gb >= min_ram:
-                table.add_row("RAM", "[green]PASS[/]", f"{ram_gb:.0f} GB ({min_ram}+ needed)")
+                table.add_row("RAM", self._status("PASS"), f"{ram_gb:.0f} GB ({min_ram}+ needed)")
             else:
-                table.add_row("RAM", "[yellow]WARN[/]", f"{ram_gb:.0f} GB ({min_ram}+ recommended)")
+                table.add_row("RAM", self._status("WARN", "warn"), f"{ram_gb:.0f} GB ({min_ram}+ recommended)")
         else:
             table.add_row("RAM", "[dim]???[/]", "Could not detect")
 
         # Architecture
         if arch in ("x86_64", "AMD64"):
-            table.add_row("Architecture", "[green]PASS[/]", arch)
+            table.add_row("Architecture", self._status("PASS"), arch)
         else:
-            table.add_row("Architecture", "[yellow]WARN[/]", f"{arch} (Rosetta may be needed)")
+            table.add_row("Architecture", self._status("WARN", "warn"), f"{arch} (Rosetta may be needed)")
 
         self.console.print(table)
 
@@ -473,7 +579,7 @@ class SetupWizard:
                 missing.append(packages[import_name])
 
         if not missing:
-            self.console.print(f"  [green]All {len(packages)} required packages installed.[/]")
+            self.console.print(f"  [green]All {len(packages)} required Python packages are installed.[/]")
             return StepResult()
 
         self.console.print(f"  [yellow]Missing: {', '.join(missing)}[/]")
@@ -484,19 +590,10 @@ class SetupWizard:
             self.console.print(f"  [yellow]Critical packages missing: {', '.join(critical_missing)}[/]")
             self.console.print(f"  [dim]Your node will not be able to launch without these.[/]")
 
-        install = questionary.confirm(
-            "Install requirements now? (pip install -r requirements.txt)",
-            default=True, style=CUSTOM_STYLE,
-        ).ask()
-
-        if install is None or not install:
-            if critical_missing:
-                self.console.print("  [yellow]Skipping. Node will NOT work without critical packages.[/]")
-            else:
-                self.console.print("  [yellow]Skipping. Install dependencies manually before running.[/]")
-            return StepResult(skipped=True)
-
-        self.console.print("  [dim]This includes PyTorch (~2 GB) and may take 5-15 minutes...[/]")
+        self.console.print(
+            "  [dim]Installing missing packages automatically. "
+            "This includes PyTorch (~2 GB) and may take 5-15 minutes...[/]"
+        )
         with self.console.status("[bold cyan]Installing Python dependencies...[/]", spinner="dots"):
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "-r", str(BASE_DIR / "requirements.txt")],
@@ -519,8 +616,15 @@ class SetupWizard:
                 "ephemeral keypair generated per process.[/]"
             )
             return StepResult(skipped=True)
-        # List existing wallets
+
+        default_name = "miner" if self.state.role == "miner" else "validator"
         wallets = self._list_wallets()
+        wallet_pairs = [
+            (wallet_name, hotkey)
+            for wallet_name, hotkeys in wallets.items()
+            for hotkey in hotkeys
+        ]
+
         if wallets:
             table = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
             table.add_column("Wallet", style="white")
@@ -532,26 +636,80 @@ class SetupWizard:
             self.console.print("  [dim]No existing wallets found in ~/.bittensor/wallets/[/]")
 
         self.console.print()
+        self.console.print(
+            "  [dim]Live miners and validators need a Bittensor hotkey. "
+            "If you only want a pipeline test, cancel and choose Demo miner.[/]"
+        )
 
-        # Wallet name
-        default_name = "miner" if self.state.role == "miner" else "validator"
-        wallet_name = self._ask_validated_name("Wallet name:", default_name)
-        if wallet_name is None:
-            return None
+        wallet_action = "manual"
+        if wallet_pairs:
+            choices = []
+            for idx, (name, hotkey) in enumerate(wallet_pairs[:20]):
+                suffix = "  (recommended)" if idx == 0 else ""
+                choices.append(questionary.Choice(
+                    f"Use existing {name}/{hotkey}{suffix}",
+                    value=("existing", name, hotkey),
+                ))
+            choices.extend([
+                questionary.Choice(
+                    f"Create a new {self.state.role} wallet/hotkey",
+                    value=("create", "", ""),
+                ),
+                questionary.Choice(
+                    "Enter a different existing wallet/hotkey",
+                    value=("manual", "", ""),
+                ),
+            ])
+            selection = questionary.select(
+                "Which wallet/hotkey should Minos use?",
+                choices=choices,
+                default=choices[0].value,
+                style=CUSTOM_STYLE,
+            ).ask()
+            if selection is None:
+                return None
+            wallet_action, wallet_name, wallet_hotkey = selection
+        else:
+            selection = questionary.select(
+                "No existing hotkeys were found. What should setup do?",
+                choices=[
+                    questionary.Choice(
+                        f"Create a new {self.state.role} wallet/hotkey",
+                        value="create",
+                    ),
+                    questionary.Choice(
+                        "Enter wallet/hotkey names and create later",
+                        value="manual",
+                    ),
+                ],
+                default="create",
+                style=CUSTOM_STYLE,
+            ).ask()
+            if selection is None:
+                return None
+            wallet_action = selection
+            wallet_name = ""
+            wallet_hotkey = ""
+
+        if wallet_action != "existing":
+            wallet_name = self._ask_validated_name("Wallet name:", default_name)
+            if wallet_name is None:
+                return None
+
+            wallet_hotkey = self._ask_validated_name("Hotkey name:", "default")
+            if wallet_hotkey is None:
+                return None
+
         self.state.wallet_name = wallet_name
-
-        # Hotkey
-        wallet_hotkey = self._ask_validated_name("Hotkey name:", "default")
-        if wallet_hotkey is None:
-            return None
         self.state.wallet_hotkey = wallet_hotkey
 
-        # Check wallet exists
         wallet_path = Path.home() / ".bittensor" / "wallets" / wallet_name
         hotkey_path = wallet_path / "hotkeys" / wallet_hotkey
 
         if hotkey_path.exists():
             self.console.print(f"  [green]Wallet found:[/] {wallet_name}/{wallet_hotkey}")
+        elif wallet_action == "create":
+            self._create_wallet(wallet_name, wallet_hotkey)
         else:
             self.console.print(f"  [yellow]Wallet '{wallet_name}/{wallet_hotkey}' not found.[/]")
             create = questionary.confirm(
@@ -674,7 +832,14 @@ class SetupWizard:
         image, size, timing = info[template]
         self.console.print(f"  Primary image: [cyan]{image}[/] ({size})")
         self.console.print(f"  Typical runtime: {timing}")
-        self.console.print(f"  [dim]All 3 tool images will be pulled so you can switch templates later.[/]")
+        if self.state.is_demo:
+            self.console.print(
+                "  [dim]Demo setup downloads only the selected tool image and chr20 reference files.[/]"
+            )
+        else:
+            self.console.print(
+                "  [dim]Live miner setup downloads all supported tool images so you can switch templates later.[/]"
+            )
 
         return StepResult()
 
@@ -709,8 +874,8 @@ class SetupWizard:
         self.state.docker_images_needed = list(needed)
 
         if shutil.which("docker") is None:
-            self.console.print("  [yellow]Docker is not installed; skipping image pull.[/]")
-            return StepResult(skipped=True)
+            self.console.print("  [red]Docker is not installed; required images cannot be pulled.[/]")
+            return StepResult(success=False)
 
         existing = []
         missing = []
@@ -725,14 +890,14 @@ class SetupWizard:
                 to_pull.append(image)
 
         # Display table
-        table = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
+        table = Table(show_header=True, header_style="bold cyan", border_style="cyan", padding=(0, 1))
         table.add_column("Image", style="white", max_width=55)
-        table.add_column("Status", justify="center", width=10)
+        table.add_column("Status", justify="center", width=12)
         for img in existing:
-            status = "[cyan]REFRESH[/]" if force_pull else "[green]PULLED[/]"
+            status = "[cyan]• REFRESH[/]" if force_pull else "[green]✓ PULLED[/]"
             table.add_row(img, status)
         for img in missing:
-            table.add_row(img, "[yellow]MISSING[/]")
+            table.add_row(img, "[yellow]⚠ MISSING[/]")
         self.console.print(table)
 
         self.state.docker_images_pulled = list(existing)
@@ -744,21 +909,15 @@ class SetupWizard:
         if force_pull:
             self.console.print("  [dim]Refreshing configured Docker image references.[/]")
         else:
-            self.console.print(f"  [dim]Total download may be several GB. This can take 5-15 minutes.[/]")
+            self.console.print("  [dim]Docker images are required to run the selected variant-calling tools.[/]")
+            self.console.print(
+                "  [dim]Missing images download automatically. "
+                "Total download may be several GB and can take 5-15 minutes.[/]"
+            )
 
-        if assume_yes:
-            pull = True
-        else:
-            action = "Refresh" if force_pull else "Pull"
-            target = "configured image(s)" if force_pull else "missing image(s)"
-            pull = questionary.confirm(
-                f"{action} {len(to_pull)} {target}?",
-                default=True, style=CUSTOM_STYLE,
-            ).ask()
-
-        if pull is None or not pull:
-            self.console.print("  [yellow]Skipping. Pull images manually before running.[/]")
-            return StepResult(skipped=True)
+        action = "Refreshing" if force_pull else "Pulling"
+        target = "configured image(s)" if force_pull else "missing image(s)"
+        self.console.print(f"  [dim]{action} {len(to_pull)} {target} automatically.[/]")
 
         failed = []
         for img in to_pull:
@@ -780,7 +939,9 @@ class SetupWizard:
             for img in failed:
                 self.console.print(f"    [yellow]- {img}[/]")
             self.console.print(f"  [dim]Pull manually with: docker pull <image>[/]")
-            self.console.print(f"  [yellow]Your node will NOT work without these images.[/]")
+            self.console.print(f"  [red]Your node cannot run until these required images are available.[/]")
+            self.console.print(f"  [dim]Retry: python setup.py --update-data-only[/]")
+            return StepResult(success=False)
 
         return StepResult()
 
@@ -901,16 +1062,24 @@ class SetupWizard:
             else:
                 to_download.append(f)
 
-        # Display table
-        table = Table(show_header=True, header_style="bold cyan", padding=(0, 1))
-        table.add_column("File", style="white", max_width=35)
-        table.add_column("Size", justify="right", width=8)
-        table.add_column("Status", justify="center", width=10)
-        for f in existing:
-            table.add_row(f["name"], f"~{f.get('size_mb', '?')} MB", "[green]EXISTS[/]")
-        for f in to_download:
-            table.add_row(f["name"], f"~{f.get('size_mb', '?')} MB", "[yellow]MISSING[/]")
-        self.console.print(table)
+        # Keep first-run output readable: validators can have hundreds of
+        # reference files, so show counts instead of dumping every row.
+        total_files = len(existing) + len(to_download)
+        total_existing_mb = sum(f.get("size_mb", 0) for f in existing)
+        total_missing_mb = sum(f.get("size_mb", 0) for f in to_download)
+        summary = Table(show_header=False, box=None, padding=(0, 1))
+        summary.add_column("Metric", style="bold white")
+        summary.add_column("Value", style="green")
+        summary.add_row("Available", f"{len(existing)}/{total_files} files (~{total_existing_mb} MB)")
+        missing_style = "green" if not to_download else "yellow"
+        summary.add_row("Missing", f"[{missing_style}]{len(to_download)} files (~{total_missing_mb} MB)[/]")
+        summary.add_row("Storage", str(BASE_DIR / "datasets" / "reference"))
+        self.console.print(Panel(summary, title="Reference data", border_style="cyan", padding=(0, 1)))
+
+        if to_download:
+            preview = ", ".join(f["name"] for f in to_download[:6])
+            suffix = "" if len(to_download) <= 6 else f", ... +{len(to_download) - 6} more"
+            self.console.print(f"  [dim]Missing preview: {preview}{suffix}[/]")
 
         if not to_download:
             self.console.print("  [green]All reference data available.[/]")
@@ -920,18 +1089,10 @@ class SetupWizard:
         total_size_mb = sum(f.get("size_mb", 0) for f in to_download)
         self.console.print(f"  [dim]Total download: ~{total_size_mb} MB[/]")
 
-        if assume_yes:
-            self.console.print("  [dim]Downloading missing reference files without prompting.[/]")
-            download = True
-        else:
-            download = questionary.confirm(
-                f"Download {len(to_download)} missing file(s)?",
-                default=True, style=CUSTOM_STYLE,
-            ).ask()
-
-        if download is None or not download:
-            self.console.print("  [yellow]Skipping. Download files before running.[/]")
-            return StepResult(skipped=True)
+        self.console.print(
+            f"  [dim]Reference files are required for variant calling and validation; "
+            f"downloading {len(to_download)} missing file(s) automatically.[/]"
+        )
 
         # Validators with most files missing: try the bundled archive first
         # (single ~1.8 GB download vs ~280 individual files). Miners skip this
@@ -1000,6 +1161,11 @@ class SetupWizard:
                 all_ok = False
 
         self.state.reference_data_ready = all_ok
+        if not all_ok:
+            self.console.print()
+            self.console.print("  [red]Reference data is incomplete; the node cannot run safely yet.[/]")
+            self.console.print("  [dim]Retry: python setup.py --update-data-only[/]")
+            return StepResult(success=False)
         return StepResult()
 
     # ── Step 8: Environment configuration ─────────────────────────────────
@@ -1083,44 +1249,23 @@ class SetupWizard:
     def step_process_management(self) -> StepResult:
         role = self.state.role
 
-        choice = questionary.select(
-            "How would you like to run your node?",
-            choices=[
-                questionary.Choice(
-                    "Generate PM2 config  (recommended — auto-restart, logs, monitoring)",
-                    value="pm2",
-                ),
-                questionary.Choice(
-                    "Generate systemd service  (Linux, auto-restart)",
-                    value="systemd",
-                ),
-                questionary.Choice(
-                    f"Run directly  (python -m neurons.{role})",
-                    value="direct",
-                ),
-                questionary.Choice(
-                    "Skip  (I will configure this myself)",
-                    value="none",
-                ),
-            ],
-            style=CUSTOM_STYLE,
-        ).ask()
-
-        if choice is None:
-            return None
-
-        self.state.process_management = choice
-
-        if choice == "direct":
-            self.console.print(f"  Run with: [bold cyan]python -m neurons.{role}[/]")
-            return StepResult()
-
-        if choice == "systemd":
-            return self._generate_systemd()
-
-        if choice == "pm2":
+        if shutil.which("pm2"):
+            self.state.process_management = "pm2"
+            self.console.print(
+                "  [green]Using PM2 automatically[/] "
+                "[dim](auto-restart, logs, monitoring).[/]"
+            )
+            self.console.print(
+                "  [dim]PM2 config is generated automatically. Setup only starts the process "
+                "when registration and required assets are ready.[/]"
+            )
             return self._generate_pm2()
 
+        self.state.process_management = "direct"
+        self.console.print("  [yellow]PM2 is not available, so no process manager was configured.[/]")
+        self.console.print("  [dim]Install PM2 later with: npm install -g pm2[/]")
+        if role in ("miner", "validator"):
+            self.console.print(f"  Run with: [bold cyan]python -m neurons.{role}[/]")
         return StepResult()
 
     # ── Step 10: Summary & launch ─────────────────────────────────────────
@@ -1165,6 +1310,8 @@ class SetupWizard:
 
         self.console.print(table)
 
+        assets_ready = n_pulled >= n_needed and self.state.reference_data_ready
+
         # Warnings
         warnings = []
         if self.state.is_demo:
@@ -1188,9 +1335,9 @@ class SetupWizard:
                 "registering, re-run setup and choose 'Demo miner'.[/]"
             )
         if n_pulled < n_needed:
-            warnings.append("Some Docker images are not pulled yet")
+            warnings.append("Required Docker images are not pulled yet")
         if not self.state.reference_data_ready:
-            warnings.append("Reference data download incomplete")
+            warnings.append("Required reference data download is incomplete")
 
         if warnings:
             self.console.print()
@@ -1203,46 +1350,50 @@ class SetupWizard:
         if pm == "systemd":
             service_name = f"minos-{role}"
             self.console.print()
-            self.console.print(f"  [bold]Manage your {role} (systemd):[/]")
-            self.console.print(f"  [dim]  sudo systemctl start {service_name}     # start[/]")
-            self.console.print(f"  [dim]  sudo systemctl stop {service_name}      # stop[/]")
-            self.console.print(f"  [dim]  sudo systemctl restart {service_name}   # restart[/]")
-            self.console.print(f"  [dim]  sudo systemctl disable {service_name}   # disable auto-start[/]")
-            self.console.print(f"  [dim]  sudo systemctl enable {service_name}    # enable auto-start[/]")
-            self.console.print(f"  [dim]  sudo systemctl status {service_name}    # check status[/]")
-            self.console.print(f"  [dim]  journalctl -u {service_name} -f         # view logs[/]")
+            self._print_command_table(f"Manage your {role} (systemd)", [
+                (f"sudo systemctl start {service_name}", "start"),
+                (f"sudo systemctl stop {service_name}", "stop"),
+                (f"sudo systemctl restart {service_name}", "restart"),
+                (f"sudo systemctl status {service_name}", "check status"),
+                (f"journalctl -u {service_name} -f", "view logs"),
+            ])
         elif pm == "pm2":
             service_name = f"minos-{role}"
             eco_file = f"ecosystem.{role}.config.js"
             self.console.print()
-            self.console.print(f"  [bold]Manage your {role} (PM2):[/]")
-            self.console.print(f"  [dim]  bash pm2-{role}.sh                    # start / restart (recommended)[/]")
-            self.console.print(f"  [dim]  pm2 start {eco_file} # start via config[/]")
-            self.console.print(f"  [dim]  pm2 stop {service_name}                 # stop[/]")
-            self.console.print(f"  [dim]  pm2 restart {service_name}              # restart[/]")
-            self.console.print(f"  [dim]  pm2 delete {service_name}               # remove from PM2[/]")
-            self.console.print(f"  [dim]  pm2 status                              # check status[/]")
-            self.console.print(f"  [dim]  pm2 logs {service_name}                 # view logs[/]")
-            self.console.print(f"  [dim]  pm2 save                                # persist across reboots[/]")
+            self._print_command_table(f"Manage your {role} (PM2)", [
+                (f"bash pm2-{role}.sh", "start or restart, recommended"),
+                (f"pm2 start {eco_file}", "start from generated config"),
+                (f"pm2 restart {service_name}", "restart"),
+                (f"pm2 stop {service_name}", "stop"),
+                (f"pm2 status", "check status"),
+                (f"pm2 logs {service_name}", "view logs"),
+                (f"pm2 save", "persist process list"),
+            ])
 
-        # PM2: always register the process so pm2 status / pm2 start works
+        # PM2: always create/update the process entry so pm2 status / pm2 start works.
+        # This is PM2 process registration only; subnet registration is handled separately.
         if pm == "pm2":
             run_cmd = f"bash pm2-{role}.sh"
             service_name = f"minos-{role}"
             eco_file = str(BASE_DIR / f"ecosystem.{role}.config.js")
             os.chdir(BASE_DIR)
 
-            # Register with PM2 (start then immediately stop if user doesn't want to launch)
-            self.console.print(f"\n  [dim]Registering {service_name} with PM2...[/]")
+            launch_blockers = []
+            if not assets_ready:
+                if n_pulled < n_needed:
+                    launch_blockers.append("required Docker images are missing")
+                if not self.state.reference_data_ready:
+                    launch_blockers.append("required reference data is incomplete")
+            if not self.state.is_demo and not self.state.wallet_registered:
+                launch_blockers.append(f"hotkey is not registered on subnet {NETUID}")
+            should_launch = not launch_blockers
+
+            self.console.print(f"\n  [dim]Preparing PM2 entry for {service_name}...[/]")
             subprocess.call(["pm2", "start", eco_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             subprocess.call(["pm2", "save"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-            launch = questionary.confirm(
-                "Launch now?",
-                default=True, style=CUSTOM_STYLE,
-            ).ask()
-
-            if launch:
+            if should_launch:
                 self.console.print(f"\n  [bold cyan]Starting Minos {role} via PM2...[/]\n")
                 subprocess.call(["pm2", "restart", service_name, "--update-env"])
                 self.console.print()
@@ -1252,38 +1403,19 @@ class SetupWizard:
             else:
                 subprocess.call(["pm2", "stop", service_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 subprocess.call(["pm2", "save"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                self.console.print(f"\n  [green]{service_name} registered with PM2 (stopped).[/]")
+                self.console.print(f"\n  [green]{service_name} PM2 entry is ready (stopped).[/]")
+                self.console.print(
+                    "  [dim]Not launching yet because:[/]"
+                )
+                for blocker in launch_blockers:
+                    self.console.print(f"  [dim]- {blocker}[/]")
                 self.console.print(f"  [dim]  pm2 start {service_name}   # start when ready[/]")
                 self.console.print(f"  [dim]  pm2 status                # check status[/]")
         else:
             run_cmd = f"python -m neurons.{role}"
             self.console.print()
             self.console.print(f"  Launch command: [bold cyan]{run_cmd}[/]")
-            self.console.print()
-
-            launch = questionary.confirm(
-                "Launch now?",
-                default=False, style=CUSTOM_STYLE,
-            ).ask()
-
-            if launch:
-                self.console.print(f"\n  [bold cyan]Starting Minos {role}...[/]\n")
-                os.chdir(BASE_DIR)
-                if pm == "systemd":
-                    service_name = f"minos-{role}"
-                    sys.exit(subprocess.call(["sudo", "systemctl", "start", service_name]))
-                else:
-                    # Direct launch
-                    needs_sg = (
-                        shutil.which("sg")
-                        and "docker" not in os.getgroups().__str__()
-                        and subprocess.run(["docker", "info"], capture_output=True).returncode != 0
-                    )
-                    if needs_sg:
-                        cmd_str = f"{sys.executable} -m neurons.{role}"
-                        sys.exit(subprocess.call(["sg", "docker", "-c", cmd_str]))
-                    else:
-                        sys.exit(subprocess.call([sys.executable, "-m", f"neurons.{role}"]))
+            self.console.print("  [dim]Direct launch is not started automatically because it takes over this terminal.[/]")
 
             self.console.print(f"\n  To start later:")
             self.console.print(f"  [dim]  cd {BASE_DIR}[/]")
@@ -1339,6 +1471,10 @@ class SetupWizard:
             return False, "Docker command timed out (daemon not running?)"
 
     def _get_ram_gb(self) -> float:
+        cgroup_limit = self._get_cgroup_memory_limit_gb()
+        if cgroup_limit > 0:
+            return cgroup_limit
+
         if platform.system() == "Darwin":
             try:
                 r = subprocess.run(
@@ -1352,6 +1488,35 @@ class SetupWizard:
                 return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1024 ** 3)
             except (ValueError, OSError, AttributeError):
                 pass
+        return 0.0
+
+    def _get_cgroup_memory_limit_gb(self) -> float:
+        """Return the effective container memory limit when cgroups expose one."""
+        candidates = [
+            Path("/sys/fs/cgroup/memory.max"),
+            Path("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        ]
+
+        for path in candidates:
+            try:
+                raw = path.read_text().strip()
+            except OSError:
+                continue
+
+            if not raw or raw == "max":
+                continue
+
+            try:
+                limit_bytes = int(raw)
+            except ValueError:
+                continue
+
+            # cgroup v1 often reports a huge sentinel when memory is unlimited.
+            if limit_bytes <= 0 or limit_bytes >= 1 << 60:
+                continue
+
+            return limit_bytes / (1024 ** 3)
+
         return 0.0
 
     def _create_wallet(self, wallet_name: str, wallet_hotkey: str):
@@ -1416,31 +1581,60 @@ class SetupWizard:
         return result
 
     def _check_registration(self, wallet_name: str, wallet_hotkey: str) -> bool:
-        """Check subnet registration with a timeout to avoid hanging on slow nodes."""
-        def _do_check():
-            import bittensor as bt
-            if not hasattr(bt, "subtensor"):
-                bt.subtensor = bt.Subtensor
-            if not hasattr(bt, "wallet"):
-                bt.wallet = bt.Wallet
-            wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
-            subtensor = bt.subtensor(network=NETWORK)
-            metagraph = subtensor.metagraph(NETUID)
-            return wallet.hotkey.ss58_address in metagraph.hotkeys
+        """Check subnet registration in a child process.
 
+        Bittensor/substrate clients can leave background threads alive after a
+        metagraph call. Running the probe in a subprocess keeps the setup wizard
+        responsive and lets the timeout actually stop the check.
+        """
+        code = f"""
+import sys
+
+try:
+    import bittensor as bt
+except ImportError:
+    print("missing-bittensor")
+    sys.exit(2)
+
+if not hasattr(bt, "subtensor"):
+    bt.subtensor = bt.Subtensor
+if not hasattr(bt, "wallet"):
+    bt.wallet = bt.Wallet
+
+wallet = bt.wallet(name={wallet_name!r}, hotkey={wallet_hotkey!r})
+subtensor = bt.subtensor(network={NETWORK!r})
+metagraph = subtensor.metagraph({NETUID})
+print("registered" if wallet.hotkey.ss58_address in metagraph.hotkeys else "not-registered")
+"""
         try:
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_do_check)
-                return future.result(timeout=60)
-        except FuturesTimeoutError:
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=str(BASE_DIR),
+            )
+        except subprocess.TimeoutExpired:
             self.console.print("  [dim]Registration check timed out (network may be slow).[/]")
-            return False
-        except ImportError:
-            self.console.print("  [dim]bittensor not installed -- cannot check registration.[/]")
             return False
         except Exception as e:
             self.console.print(f"  [dim]Could not verify registration: {type(e).__name__}[/]")
             return False
+
+        output = (result.stdout or "").strip().splitlines()
+        status = output[-1].strip() if output else ""
+        if result.returncode == 2 or status == "missing-bittensor":
+            self.console.print("  [dim]bittensor not installed -- cannot check registration.[/]")
+            return False
+        if result.returncode != 0:
+            detail = (result.stderr or status or "unknown error").strip().splitlines()
+            if detail:
+                self.console.print(f"  [dim]Could not verify registration: {detail[-1][:120]}[/]")
+            else:
+                self.console.print("  [dim]Could not verify registration.[/]")
+            return False
+
+        return status == "registered"
 
     def _docker_image_exists(self, image: str) -> bool:
         try:
@@ -1589,14 +1783,6 @@ WantedBy=multi-user.target
             padding=(0, 1),
         ))
 
-        write = questionary.confirm(
-            f"Write {service_name}.service?",
-            default=True, style=CUSTOM_STYLE,
-        ).ask()
-
-        if write is None or not write:
-            return StepResult(skipped=True)
-
         service_path = BASE_DIR / f"{service_name}.service"
         service_path.write_text(service)
         self.console.print(f"  [green]Written to {service_path}[/]")
@@ -1639,14 +1825,6 @@ WantedBy=multi-user.target
             padding=(0, 1),
         ))
 
-        write = questionary.confirm(
-            f"Write {config_name}?",
-            default=True, style=CUSTOM_STYLE,
-        ).ask()
-
-        if write is None or not write:
-            return StepResult(skipped=True)
-
         config_path = BASE_DIR / config_name
         config_path.write_text(config)
         self.console.print(f"  [green]Written to {config_path}[/]")
@@ -1667,8 +1845,8 @@ if __name__ == "__main__":
 
     if "--update-data-only" in sys.argv:
         # Non-interactive: refresh configured Docker images and reference data.
-        # Restore is_demo + selected template from .env so demo installs don't
-        # silently bloat back to all-chromosomes + all-templates on update.
+        # Restore demo mode and the selected template from .env so update-only
+        # runs keep the same narrow scope as the configured miner.
         env_path = BASE_DIR / ".env"
         env_vars: Dict[str, str] = {}
         if env_path.exists():
@@ -1690,16 +1868,22 @@ if __name__ == "__main__":
         else:
             wizard.state.role = "validator"  # download all (superset)
 
-        # Truthy MINER_DEMO → narrow reference data to chr20 + docker images
-        # to the chosen template only (mirrors the wizard's Demo-miner branch).
+        # Truthy MINER_DEMO narrows reference data to chr20 and Docker images
+        # to the chosen template only, matching the wizard's demo-miner branch.
         if env_vars.get("MINER_DEMO", "").strip().lower() in ("1", "true", "yes", "on"):
             wizard.state.is_demo = True
 
         scope = "demo " if wizard.state.is_demo else ""
         print(f"\n  Updating {scope}{wizard.state.role} Docker images and reference data...\n")
-        wizard.step_docker_images(force_pull=True, assume_yes=True)
+        docker_result = wizard.step_docker_images(force_pull=True, assume_yes=True)
+        if not docker_result.success:
+            print("\n  Docker image update failed.\n")
+            sys.exit(1)
         print("\n  Checking reference data...\n")
-        wizard.step_reference_data(assume_yes=True)
+        reference_result = wizard.step_reference_data(assume_yes=True)
+        if not reference_result.success:
+            print("\n  Reference data update failed.\n")
+            sys.exit(1)
         print("\n  Update-data-only finished.\n")
     else:
         wizard.run()

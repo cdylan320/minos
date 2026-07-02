@@ -15,39 +15,218 @@ fi
 set -eo pipefail
 trap 'fail "Unexpected error on line $LINENO. Re-run with: bash -x install.sh for debug output."' ERR
 
-# --- Colors ---
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m' # No Color
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MIN_PYTHON_MAJOR=3
 MIN_PYTHON_MINOR=10
 DOCKER_JUST_INSTALLED=false
+INSTALL_MODE_LABEL="full setup"
+SKIP_AI_ASSISTANT=false
 
 # --- Helpers ---
 
-info()  { echo -e "${CYAN}[INFO]${NC}  $1"; }
-ok()    { echo -e "${GREEN}[OK]${NC}    $1"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
-fail()  { echo -e "${RED}[FAIL]${NC}  $1"; }
-header() { echo -e "\n${BOLD}$1${NC}"; echo "────────────────────────────────────────"; }
+setup_terminal_ui() {
+    RED=""
+    GREEN=""
+    YELLOW=""
+    CYAN=""
+    DIM=""
+    BOLD=""
+    NC=""
+    TERM_WIDTH=78
+    USE_TTY_UI=false
 
-ask_yes_no() {
-    local prompt="$1"
-    local default="${2:-y}"
-    local yn
-    if [[ "$default" == "y" ]]; then
-        read -rp "$(echo -e "${BOLD}$prompt [Y/n]:${NC} ")" yn
-        yn="${yn:-y}"
-    else
-        read -rp "$(echo -e "${BOLD}$prompt [y/N]:${NC} ")" yn
-        yn="${yn:-n}"
+    if command -v tput &>/dev/null; then
+        TERM_WIDTH="$(tput cols 2>/dev/null || echo 78)"
+        if [[ -z "$TERM_WIDTH" ]] || (( TERM_WIDTH < 60 )); then
+            TERM_WIDTH=78
+        elif (( TERM_WIDTH > 96 )); then
+            TERM_WIDTH=96
+        fi
     fi
-    [[ "$yn" =~ ^[Yy] ]]
+
+    if [[ -z "${NO_COLOR:-}" ]] && [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && command -v tput &>/dev/null; then
+        local colors
+        colors="$(tput colors 2>/dev/null || echo 0)"
+        if [[ "$colors" =~ ^[0-9]+$ ]] && (( colors >= 8 )); then
+            RED="$(tput setaf 1)"
+            GREEN="$(tput setaf 2)"
+            YELLOW="$(tput setaf 3)"
+            CYAN="$(tput setaf 6)"
+            BOLD="$(tput bold)"
+            DIM="$(tput dim 2>/dev/null || true)"
+            NC="$(tput sgr0)"
+            USE_TTY_UI=true
+        fi
+    fi
+}
+
+repeat_char() {
+    local char="${1:--}"
+    local count="${2:-$TERM_WIDTH}"
+    local output=""
+    local i
+
+    for ((i = 0; i < count; i++)); do
+        output+="$char"
+    done
+    printf '%s' "$output"
+}
+
+rule() {
+    local width="${1:-$TERM_WIDTH}"
+    printf '%s\n' "${DIM}$(repeat_char "-" "$width")${NC}"
+}
+
+panel() {
+    local title="$1"
+    local body="$2"
+    local width="${3:-76}"
+    local title_text=" $title "
+    local inner_width=$((width - 4))
+    local line wrapped
+
+    if [[ "$USE_TTY_UI" != "true" ]]; then
+        printf '\n%s\n' "$title"
+        printf '%s\n' "$body"
+        return
+    fi
+
+    if (( width > TERM_WIDTH )); then
+        width="$TERM_WIDTH"
+        inner_width=$((width - 4))
+    fi
+
+    printf '\n%s╭─%s%s%s%s%s╮%s\n' \
+        "$CYAN" "$BOLD" "$title_text" "$NC" "$CYAN" \
+        "$(repeat_char "─" $((width - 3 - ${#title_text})))" "$NC"
+    while IFS= read -r line; do
+        if [[ -z "$line" ]]; then
+            printf '%s│%s %-*s %s│%s\n' "$CYAN" "$NC" "$inner_width" "" "$CYAN" "$NC"
+            continue
+        fi
+        while IFS= read -r wrapped; do
+            printf '%s│%s %-*s %s│%s\n' "$CYAN" "$NC" "$inner_width" "$wrapped" "$CYAN" "$NC"
+        done < <(printf '%s\n' "$line" | fold -s -w "$inner_width")
+    done <<< "$body"
+    printf '%s╰%s╯%s\n' "$CYAN" "$(repeat_char "─" $((width - 2)))" "$NC"
+}
+
+banner() {
+    panel "Minos Subnet Installer" "Decentralized genomic variant calling on Bittensor SN107
+Safe to re-run: completed steps are detected and reused." 76
+    printf '  %-14s %s\n' "Mode" "$INSTALL_MODE_LABEL"
+    printf '  %-14s %s\n' "Directory" "$SCRIPT_DIR"
+    printf '  %-14s %s\n' "Python" "${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}+ required"
+    printf '  %-14s %s\n' "Color" "$([[ -n "$NC" ]] && echo "enabled" || echo "plain text")"
+    printf '\n'
+}
+
+section() {
+    printf '\n%s◆%s %s%s%s\n' "$CYAN" "$NC" "$BOLD" "$1" "$NC"
+    rule 76
+}
+
+status_line() {
+    local symbol="$1"
+    local color="$2"
+    shift 2
+    printf '  %s%s%s %s\n' "$color" "$symbol" "$NC" "$*"
+}
+
+info()  { status_line "•" "$CYAN" "$1"; }
+ok()    { status_line "✓" "$GREEN" "$1"; }
+warn()  { status_line "⚠" "$YELLOW" "$1"; }
+fail()  { status_line "✗" "$RED" "$1" >&2; }
+header() { section "$1"; }
+
+usage() {
+    cat <<'EOF'
+Minos Subnet Installer
+
+Usage:
+  bash install.sh [OPTIONS]
+
+Options:
+  --fresh, --full       Redo the full setup even if an existing install is detected.
+  --no-ai-assistant    Skip the optional Minos Miner AI Assistant prompt.
+  --help, -h           Show this help.
+
+Examples:
+  bash install.sh
+  bash install.sh --fresh
+  bash install.sh --no-ai-assistant
+  NO_COLOR=1 bash install.sh
+
+What this does:
+  - Checks OS, Python, Docker, Node/npm, and PM2.
+  - Creates or reuses the Python virtual environment.
+  - Installs Python dependencies.
+  - Launches the interactive Minos setup wizard.
+  - Optionally offers the Minos Miner AI Assistant setup.
+
+Safety:
+  The installer does not print wallet secrets, private keys, .env values, or
+  model API keys. Optional assistant setup is public-memory/runtime setup only.
+EOF
+}
+
+print_command() {
+    printf '  %s%s%s\n' "$DIM" "$1" "$NC"
+}
+
+print_log_tail() {
+    local log_file="$1"
+    if [[ -f "$log_file" ]]; then
+        tail -5 "$log_file" | sed 's/^/      /' >&2
+    fi
+}
+
+run_quiet() {
+    local message="$1"
+    local log_file="$2"
+    shift 2
+
+    if [[ "$USE_TTY_UI" != "true" ]]; then
+        info "$message"
+        "$@"
+        return
+    fi
+
+    : > "$log_file"
+    "$@" >"$log_file" 2>&1 &
+    local pid=$!
+    local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+    local i=0
+
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r  %s%s%s %s' "$CYAN" "${frames[$((i % ${#frames[@]}))]}" "$NC" "$message"
+        i=$((i + 1))
+        sleep 0.12
+    done
+
+    if wait "$pid"; then
+        printf '\r\033[K'
+        ok "$message"
+        return 0
+    fi
+
+    printf '\r\033[K'
+    fail "$message"
+    print_log_tail "$log_file"
+    return 1
+}
+
+success_card() {
+    local title="$1"
+    local body="$2"
+    if [[ "$USE_TTY_UI" == "true" ]]; then
+        local saved_cyan="$CYAN"
+        CYAN="$GREEN"
+        panel "✓ $title" "$body" 76
+        CYAN="$saved_cyan"
+    else
+        printf '\n%s\n%s\n\n' "$title" "$body"
+    fi
 }
 
 # Check if a Python command meets the minimum version requirement
@@ -92,7 +271,7 @@ detect_os() {
             ;;
         MINGW*|MSYS*|CYGWIN*)
             fail "Windows detected. Please use WSL2 (Windows Subsystem for Linux)."
-            echo "  Install WSL2: https://learn.microsoft.com/en-us/windows/wsl/install"
+            print_command "Install WSL2: https://learn.microsoft.com/en-us/windows/wsl/install"
             exit 1
             ;;
         *)
@@ -127,20 +306,19 @@ check_python() {
 
     case "$PKG_MANAGER" in
         apt)
-            if ask_yes_no "Install Python via apt?"; then
-                sudo apt-get update -qq
-                sudo apt-get install -y python3 python3-venv python3-pip
-                PYTHON_CMD="python3"
-            fi
+            info "Installing Python via apt..."
+            sudo apt-get update -qq
+            sudo apt-get install -y python3 python3-venv python3-pip
+            PYTHON_CMD="python3"
             ;;
         dnf|yum)
-            if ask_yes_no "Install Python via $PKG_MANAGER?"; then
-                sudo "$PKG_MANAGER" install -y python3 python3-pip python3-libs
-                PYTHON_CMD="python3"
-            fi
+            info "Installing Python via $PKG_MANAGER..."
+            sudo "$PKG_MANAGER" install -y python3 python3-pip python3-libs
+            PYTHON_CMD="python3"
             ;;
         brew)
-            if command -v brew &>/dev/null && ask_yes_no "Install Python via Homebrew?"; then
+            if command -v brew &>/dev/null; then
+                info "Installing Python via Homebrew..."
                 brew install python@3.12
                 # Re-resolve: brew-installed Python may not be the default python3
                 if command -v python3.12 &>/dev/null; then
@@ -240,13 +418,22 @@ check_docker() {
             warn "Docker $docker_ver installed but daemon is not running."
             if [[ "$OS" == "Darwin" ]]; then
                 warn "Start Docker Desktop before running your miner/validator."
-            else
-                warn "Start with: sudo systemctl start docker"
+                exit 1
             fi
-            if ask_yes_no "Continue setup without Docker?" "n"; then
-                warn "Continuing — Docker must be running before launching your node."
+
+            info "Trying to start Docker..."
+            if command -v systemctl &>/dev/null; then
+                sudo systemctl start docker 2>/dev/null || true
+            elif command -v service &>/dev/null; then
+                sudo service docker start 2>/dev/null || true
+            fi
+
+            if docker info &>/dev/null; then
+                ok "Docker daemon started"
                 return
             fi
+            fail "Docker is installed but the daemon is not running."
+            print_command "Start it manually: sudo systemctl start docker"
             exit 1
         fi
     fi
@@ -255,42 +442,54 @@ check_docker() {
 
     case "$OS" in
         Linux)
-            if ask_yes_no "Install Docker via official script (get.docker.com)?"; then
-                if ! command -v curl &>/dev/null; then
-                    fail "curl is required to download the Docker install script."
-                    if [[ -n "$PKG_MANAGER" ]]; then
-                        fail "Install it with: sudo $PKG_MANAGER install curl"
-                    else
-                        fail "Please install curl and re-run this script."
-                    fi
-                    exit 1
-                fi
-                info "This will download and run Docker's official install script with sudo."
-                info "Review it at: https://get.docker.com"
-                info "Downloading Docker install script..."
-                curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-                sudo sh /tmp/get-docker.sh
-                rm -f /tmp/get-docker.sh
-
-                # Add current user to docker group
-                local current_user="${USER:-$(whoami)}"
-                if ! groups "$current_user" 2>/dev/null | grep -q docker; then
-                    sudo usermod -aG docker "$current_user"
-                    warn "Added $current_user to docker group. You may need to log out and back in."
-                    warn "Or run: newgrp docker"
-                fi
-
-                ok "Docker installed and started."
-                DOCKER_JUST_INSTALLED=true
-            else
-                fail "Docker is required. Install it and re-run this script."
-                exit 1
+            info "Installing Docker via the official Docker script..."
+            info "Review source: https://get.docker.com"
+            if ! command -v curl &>/dev/null; then
+                info "Installing curl for Docker bootstrap..."
+                case "$PKG_MANAGER" in
+                    apt)
+                        sudo apt-get update -qq
+                        sudo apt-get install -y curl ca-certificates
+                        ;;
+                    dnf|yum)
+                        sudo "$PKG_MANAGER" install -y curl ca-certificates
+                        ;;
+                    *)
+                        fail "curl is required to download Docker."
+                        print_command "Install curl and re-run: bash install.sh"
+                        exit 1
+                        ;;
+                esac
             fi
+
+            info "Downloading Docker install script..."
+            curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+            sudo sh /tmp/get-docker.sh
+            rm -f /tmp/get-docker.sh
+
+            # Add current user to docker group
+            local current_user="${USER:-$(whoami)}"
+            if ! groups "$current_user" 2>/dev/null | grep -q docker; then
+                sudo usermod -aG docker "$current_user"
+                warn "Added $current_user to docker group. You may need to log out and back in."
+                warn "Or run: newgrp docker"
+            fi
+
+            if ! docker info &>/dev/null; then
+                if command -v systemctl &>/dev/null; then
+                    sudo systemctl start docker 2>/dev/null || true
+                elif command -v service &>/dev/null; then
+                    sudo service docker start 2>/dev/null || true
+                fi
+            fi
+
+            ok "Docker installed."
+            DOCKER_JUST_INSTALLED=true
             ;;
         Darwin)
             fail "Docker Desktop is required on macOS."
-            echo "  Download from: https://www.docker.com/products/docker-desktop/"
-            echo "  Install it, start it, then re-run this script."
+            print_command "Download from: https://www.docker.com/products/docker-desktop/"
+            print_command "Install it, start it, then re-run this script."
             exit 1
             ;;
     esac
@@ -301,7 +500,17 @@ check_docker() {
 setup_venv() {
     header "Setting up Python virtual environment"
 
-    local venv_dir="$SCRIPT_DIR/.venv"
+    local venv_dir="${1:-$SCRIPT_DIR/.venv}"
+    local venv_label
+    if [[ "$venv_dir" == "$SCRIPT_DIR/.venv" ]]; then
+        venv_label=".venv"
+    else
+        venv_label="$venv_dir"
+    fi
+    local managed_minosvm_venv=false
+    if [[ "$venv_dir" == "/opt/minosvm_venv" ]]; then
+        managed_minosvm_venv=true
+    fi
 
     # On apt systems, ensure the version-specific venv package is installed before any
     # venv creation attempt. Ubuntu ships python3.12 without python3.12-venv by default;
@@ -321,9 +530,26 @@ setup_venv() {
         fi
     fi
 
-    # If .venv exists but bin/activate is missing, it's a partial/failed creation — clean it up.
+    # If the virtual environment exists but bin/activate is missing, it's a
+    # partial/failed creation. Repo-local .venv can be repaired; MinosVM's
+    # managed /opt runtime should fail clearly rather than being deleted.
     if [[ -d "$venv_dir" ]] && [[ ! -f "$venv_dir/bin/activate" ]]; then
-        warn ".venv exists but is incomplete (previous install may have failed). Removing and recreating..."
+        if [[ "$managed_minosvm_venv" == "true" ]]; then
+            fail "$venv_label exists but is incomplete."
+            print_command "Run: bash install.sh --fresh"
+            exit 1
+        fi
+        warn "$venv_label exists but is incomplete (previous install may have failed). Removing and recreating..."
+        rm -rf "$venv_dir"
+    fi
+
+    if [[ -d "$venv_dir" && -f "$venv_dir/bin/activate" && ! -x "$venv_dir/bin/python" ]]; then
+        if [[ "$managed_minosvm_venv" == "true" ]]; then
+            fail "$venv_label is missing an executable Python."
+            print_command "Run: bash install.sh --fresh"
+            exit 1
+        fi
+        warn "$venv_label is missing an executable Python. Removing and recreating..."
         rm -rf "$venv_dir"
     fi
 
@@ -334,17 +560,18 @@ setup_venv() {
         expected_ver="$("$PYTHON_CMD" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)"
 
         if [[ -n "$venv_py_ver" ]] && [[ "$venv_py_ver" != "$expected_ver" ]]; then
-            warn "Existing .venv uses Python $venv_py_ver but system has $expected_ver."
-            if ask_yes_no "Recreate virtual environment with Python $expected_ver?"; then
-                rm -rf "$venv_dir"
-                info "Creating virtual environment..."
-                "$PYTHON_CMD" -m venv "$venv_dir"
-                ok "Virtual environment recreated with Python $expected_ver"
-            else
-                ok "Keeping existing .venv (Python $venv_py_ver)"
+            if [[ "$managed_minosvm_venv" == "true" ]]; then
+                fail "$venv_label uses Python $venv_py_ver but system has $expected_ver."
+                print_command "Run: bash install.sh --fresh"
+                exit 1
             fi
+            warn "Existing $venv_label uses Python $venv_py_ver but system has $expected_ver."
+            info "Recreating virtual environment with Python $expected_ver..."
+            rm -rf "$venv_dir"
+            "$PYTHON_CMD" -m venv "$venv_dir"
+            ok "Virtual environment recreated with Python $expected_ver"
         else
-            ok "Virtual environment exists at .venv/ (Python ${venv_py_ver:-unknown})"
+            ok "Virtual environment exists at $venv_label (Python ${venv_py_ver:-unknown})"
         fi
     else
         # Verify venv module is available before creating
@@ -359,7 +586,7 @@ setup_venv() {
         fi
         info "Creating virtual environment..."
         "$PYTHON_CMD" -m venv "$venv_dir"
-        ok "Virtual environment created at .venv/"
+        ok "Virtual environment created at $venv_label"
     fi
 
     # shellcheck disable=SC1091
@@ -379,9 +606,12 @@ install_deps() {
         exit 1
     fi
 
-    info "Installing Python dependencies (includes PyTorch ~2 GB, may take 5-15 minutes)..."
-    pip install --upgrade pip
-    if ! pip install -r "$req_file"; then
+    info "Installing Python dependencies (includes PyTorch ~2 GB; this may take 5-15 minutes)."
+    if ! run_quiet "Upgrading pip" "/tmp/minos-pip-upgrade.log" pip install --upgrade pip -q; then
+        fail "pip upgrade failed. Check /tmp/minos-pip-upgrade.log for details."
+        exit 1
+    fi
+    if ! run_quiet "Installing requirements.txt" "/tmp/minos-pip-requirements.log" pip install -r "$req_file" -q; then
         fail "pip install failed. Check the output above for details."
         if [[ "$PKG_MANAGER" == "apt" ]]; then
             fail "Common fix: sudo apt-get install python3-dev build-essential zlib1g-dev"
@@ -392,12 +622,12 @@ install_deps() {
     ok "All dependencies installed."
 }
 
-# --- Node.js (prerequisite for PM2) ---
+# --- Node.js (prerequisite for PM2 and optional AI runtimes) ---
 #
 # Fresh Ubuntu cloud images don't ship Node/npm, and the distro's apt
-# nodejs is too old (Ubuntu 22.04 → Node 12; pm2 needs ≥16). NodeSource
-# is the official upstream-managed apt repo that ships current LTS for
-# all supported Ubuntu/Debian releases. macOS gets node via Homebrew.
+# nodejs can be too old for PM2 and OpenClaw. NodeSource is the official
+# upstream-managed apt repo that ships a current Node release for supported
+# Ubuntu/Debian releases. macOS gets node via Homebrew.
 
 install_node() {
     header "Node.js (for PM2)"
@@ -405,11 +635,15 @@ install_node() {
     if command -v node &>/dev/null; then
         local major
         major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-        if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 18 )); then
-            ok "Node $(node -v) (npm $(npm -v 2>/dev/null || echo '?'))"
-            return
+        if [[ "$major" =~ ^[0-9]+$ ]] && (( major >= 22 )); then
+            if command -v npm &>/dev/null; then
+                ok "Node $(node -v) (npm $(npm -v 2>/dev/null || echo '?'))"
+                return
+            fi
+            warn "Node $(node -v) found, but npm is missing. Repairing Node/npm so PM2 can be installed."
+        else
+            warn "Node $(node -v) is too old for the current Minos tooling; will upgrade."
         fi
-        warn "Node $(node -v) is too old for current PM2; will upgrade."
     fi
 
     # Node install is best-effort — PM2 is optional, and an existing miner
@@ -422,28 +656,40 @@ install_node() {
 
     case "$PKG_MANAGER" in
         apt)
-            info "Adding NodeSource repo for Node 20.x (current LTS)..."
+            info "Updating apt package index for Node/npm..."
+            if ! sudo apt-get update -qq >>"$nodelog" 2>&1; then
+                warn "apt-get update failed while preparing Node/npm. Last log lines:"
+                print_log_tail "$nodelog"
+            fi
+
+            info "Adding NodeSource repo for Node 22.x..."
             if ! sudo apt-get install -y -qq curl ca-certificates gnupg >>"$nodelog" 2>&1; then
                 warn "Failed to install NodeSource prereqs (curl/gpg). See $nodelog. Skipping Node install."
                 return
             fi
-            if curl -fsSL https://deb.nodesource.com/setup_20.x 2>>"$nodelog" | sudo -E bash - >>"$nodelog" 2>&1; then
+            if curl -fsSL https://deb.nodesource.com/setup_22.x 2>>"$nodelog" | sudo bash - >>"$nodelog" 2>&1; then
                 if ! sudo apt-get install -y nodejs >>"$nodelog" 2>&1; then
                     warn "apt-get install nodejs failed. Last log lines:"
-                    tail -5 "$nodelog" | sed 's/^/    /' >&2
+                    print_log_tail "$nodelog"
                     return
                 fi
             else
-                warn "NodeSource setup_20.x failed (network/proxy/sudo). Last lines:"
-                tail -5 "$nodelog" | sed 's/^/    /' >&2
-                warn "Falling back to distro nodejs (may be too old for PM2)."
+                warn "NodeSource setup_22.x failed (network/proxy/sudo). Last lines:"
+                print_log_tail "$nodelog"
+                warn "Falling back to distro nodejs (may be too old for optional AI runtimes)."
                 sudo apt-get install -y nodejs npm >>"$nodelog" 2>&1 \
                     || warn "Distro nodejs install also failed. See $nodelog."
             fi
+
+            if command -v node &>/dev/null && ! command -v npm &>/dev/null; then
+                warn "Node is present but npm is still missing. Installing distro npm package..."
+                sudo apt-get install -y npm >>"$nodelog" 2>&1 \
+                    || warn "npm install failed. See $nodelog."
+            fi
             ;;
         dnf|yum)
-            info "Adding NodeSource repo for Node 20.x..."
-            if curl -fsSL https://rpm.nodesource.com/setup_20.x 2>>"$nodelog" | sudo -E bash - >>"$nodelog" 2>&1; then
+            info "Adding NodeSource repo for Node 22.x..."
+            if curl -fsSL https://rpm.nodesource.com/setup_22.x 2>>"$nodelog" | sudo bash - >>"$nodelog" 2>&1; then
                 sudo "$PKG_MANAGER" install -y nodejs >>"$nodelog" 2>&1 \
                     || { warn "nodejs install failed (see $nodelog)"; return; }
             else
@@ -451,21 +697,28 @@ install_node() {
                 sudo "$PKG_MANAGER" install -y nodejs npm >>"$nodelog" 2>&1 \
                     || warn "Distro nodejs install failed (see $nodelog)"
             fi
+            if command -v node &>/dev/null && ! command -v npm &>/dev/null; then
+                warn "Node is present but npm is still missing. Installing npm package..."
+                sudo "$PKG_MANAGER" install -y npm >>"$nodelog" 2>&1 \
+                    || warn "npm install failed. See $nodelog."
+            fi
             ;;
         brew)
             if ! brew install node >>"$nodelog" 2>&1; then
                 warn "brew install node failed. Last log lines:"
-                tail -5 "$nodelog" | sed 's/^/    /' >&2
+                print_log_tail "$nodelog"
             fi
             ;;
         *)
-            warn "Unknown package manager '${PKG_MANAGER:-?}'; install Node 18+ manually then re-run install.sh"
+            warn "Unknown package manager '${PKG_MANAGER:-?}'; install Node 22+ manually then re-run install.sh"
             return
             ;;
     esac
 
-    if command -v node &>/dev/null; then
-        ok "Node $(node -v) installed"
+    if command -v node &>/dev/null && command -v npm &>/dev/null; then
+        ok "Node $(node -v) and npm $(npm -v) installed"
+    elif command -v node &>/dev/null; then
+        warn "Node $(node -v) is installed, but npm is still missing (see $nodelog). PM2 will be skipped."
     else
         warn "Node install did not produce a 'node' binary on PATH (see $nodelog). PM2 will be skipped."
     fi
@@ -491,20 +744,42 @@ install_pm2() {
     # `npm install -g` needs sudo unless npm's prefix is user-writable
     # (nvm, ~/.local prefix, etc.). Detecting writability is cheaper and
     # more accurate than guessing from `whoami`.
-    local prefix_dir cmd
-    prefix_dir="$(npm config get prefix 2>/dev/null)/lib/node_modules"
+    local npm_prefix prefix_dir prefix_bin
+    local -a install_cmd
+    npm_prefix="$(npm config get prefix 2>/dev/null || true)"
+    prefix_dir="$npm_prefix/lib/node_modules"
+    prefix_bin="$npm_prefix/bin"
     if [[ -w "$prefix_dir" ]] || [[ "$(id -u)" == "0" ]]; then
-        cmd="npm install -g pm2"
+        install_cmd=(npm install -g pm2)
     else
-        cmd="sudo -E npm install -g pm2"
+        install_cmd=(sudo npm install -g pm2)
     fi
 
     local log="/tmp/minos-pm2-install.log"
     local try
     for try in 1 2 3; do
-        info "Installing PM2 (attempt $try/3): $cmd"
-        if $cmd >"$log" 2>&1; then
-            ok "PM2 installed ($(pm2 -v 2>/dev/null || echo ok))"
+        info "Installing PM2 (attempt $try/3): ${install_cmd[*]}"
+        if "${install_cmd[@]}" >"$log" 2>&1; then
+            hash -r 2>/dev/null || true
+            if command -v pm2 &>/dev/null; then
+                ok "PM2 installed ($(pm2 -v 2>/dev/null || echo ok))"
+                return
+            fi
+            if [[ -n "$prefix_bin" && -x "$prefix_bin/pm2" ]]; then
+                export PATH="$prefix_bin:$PATH"
+                if command -v pm2 &>/dev/null; then
+                    ok "PM2 installed ($(pm2 -v 2>/dev/null || echo ok))"
+                    warn "PM2 was installed under $prefix_bin. Add it to PATH if future shells cannot find pm2:"
+                    warn "  export PATH=\"$prefix_bin:\$PATH\""
+                    return
+                fi
+                warn "PM2 installed at $prefix_bin/pm2, but that directory is not on PATH."
+                warn "Add it to PATH, then verify with: pm2 -v"
+                return
+            fi
+            warn "npm reported PM2 installed, but no pm2 binary was found on PATH."
+            warn "Last npm log lines:"
+            print_log_tail "$log"
             return
         fi
         warn "PM2 install attempt $try failed (see $log for npm output)"
@@ -514,7 +789,7 @@ install_pm2() {
     done
     warn "PM2 install failed after 3 tries. To debug:"
     warn "  cat $log"
-    warn "  $cmd          # run manually"
+    warn "  ${install_cmd[*]}          # run manually"
     warn "PM2 is optional — the miner/validator runs fine without it."
 }
 
@@ -545,17 +820,47 @@ launch_wizard() {
     fi
 }
 
+show_optional_ai_assistant_next_step() {
+    local mode="${1:-prompt}"
+    local prompt_script="$SCRIPT_DIR/scripts/prompt_ai_assistant.sh"
+    if [[ "$SKIP_AI_ASSISTANT" == "true" ]]; then
+        return
+    fi
+    if [[ -f "$prompt_script" ]]; then
+        if [[ "$mode" == "prompt" ]]; then
+            bash "$prompt_script" --prompt --once --default y --role miner || true
+        else
+            bash "$prompt_script" --print --role miner || true
+        fi
+    fi
+}
+
 # --- Update mode (existing install detected) ---
 
 update_only() {
     header "Existing installation detected — updating"
 
-    local venv_dir="$SCRIPT_DIR/.venv"
+    local venv_dir="${1:-$SCRIPT_DIR/.venv}"
+    local venv_py_ver expected_ver
+
+    if [[ ! -f "$venv_dir/bin/activate" || ! -x "$venv_dir/bin/python" ]]; then
+        fail "Existing install points to an incomplete virtual environment: $venv_dir"
+        print_command "Run: bash install.sh --fresh"
+        exit 1
+    fi
+
+    venv_py_ver="$("$venv_dir/bin/python" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || true)"
+    expected_ver="$("$PYTHON_CMD" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || true)"
+    if [[ -n "$venv_py_ver" && -n "$expected_ver" && "$venv_py_ver" != "$expected_ver" ]]; then
+        fail "$venv_dir uses Python $venv_py_ver, but the current system Python is $expected_ver."
+        print_command "Run: bash install.sh --fresh"
+        exit 1
+    fi
 
     # Activate venv
     # shellcheck disable=SC1091
     source "$venv_dir/bin/activate"
-    ok "Activated .venv ($(python --version 2>&1))"
+    ok "Activated $venv_dir ($(python --version 2>&1))"
 
     # Update pip deps (only installs new/changed packages)
     info "Checking for dependency updates..."
@@ -566,7 +871,7 @@ update_only() {
     install_node
     install_pm2
 
-    # Run migration + reference data download via setup.py --update-only
+    # Run migration + reference data download via setup.py --update-data-only
     info "Checking reference data..."
     python "$SCRIPT_DIR/setup.py" --update-data-only
 }
@@ -574,45 +879,67 @@ update_only() {
 # --- Main ---
 
 main() {
-    echo ""
-    echo -e "${BOLD}${CYAN}Minos Subnet Installer${NC}"
-    echo "━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-
+    setup_terminal_ui
     local fresh=false
-    if [[ "${1:-}" == "--fresh" ]] || [[ "${1:-}" == "--full" ]]; then
-        fresh=true
-    fi
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --fresh|--full)
+                fresh=true
+                shift
+                ;;
+            --no-ai-assistant)
+                SKIP_AI_ASSISTANT=true
+                shift
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                echo "Run: bash install.sh --help" >&2
+                exit 1
+                ;;
+        esac
+    done
 
     local venv_dir="$SCRIPT_DIR/.venv"
     local env_file="$SCRIPT_DIR/.env"
 
-    # Detect existing install (local .venv or MinosVM /opt/minosvm_venv)
+    # Reuse MinosVM's preinstalled runtime when present. Existing installs still
+    # require .env for update mode; fresh MinosVM first runs reuse /opt instead
+    # of creating a second repo-local .venv.
     local minosvm_venv="/opt/minosvm_venv"
-    if [[ "$fresh" == "false" ]] && [[ -f "$minosvm_venv/bin/activate" ]] && [[ -f "$env_file" ]]; then
+    if [[ "$fresh" == "false" ]] && [[ -f "$minosvm_venv/bin/activate" && -x "$minosvm_venv/bin/python" ]]; then
         venv_dir="$minosvm_venv"
     fi
     if [[ "$fresh" == "false" ]] && [[ -f "$venv_dir/bin/activate" ]] && [[ -f "$env_file" ]]; then
+        INSTALL_MODE_LABEL="update existing install"
+        banner
         detect_os
         check_python
         check_zstd
         check_docker
-        update_only
-        echo ""
-        echo -e "${GREEN}Update complete.${NC} Run with ${BOLD}--fresh${NC} to redo full setup."
+        update_only "$venv_dir"
+        show_optional_ai_assistant_next_step "print"
+        success_card "Update complete" "Run bash install.sh --fresh to redo the full setup."
         exit 0
     fi
 
     # Full install
+    INSTALL_MODE_LABEL="full setup"
+    banner
     detect_os
     check_python
     check_zstd
     check_docker
-    setup_venv
+    setup_venv "$venv_dir"
     install_deps
     install_node
     install_pm2
     launch_wizard
+    show_optional_ai_assistant_next_step "prompt"
+    success_card "Install finished" "Your Minos node setup flow is complete. Use bash start-miner.sh or pm2-miner.sh to run the miner."
 }
 
 main "$@"

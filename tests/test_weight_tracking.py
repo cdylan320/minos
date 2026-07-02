@@ -39,17 +39,17 @@ def _seed_participation(tracker: ScoreTracker, hotkeys, count: int):
 
 
 class TestRoundOnlyState:
-    def test_update_records_latest_round_score_without_smoothing(self, score_tracker):
+    def test_update_records_latest_round_score_directly(self, score_tracker):
         assert score_tracker.update("hk_a", 1.0) == pytest.approx(1.0)
         assert score_tracker.update("hk_a", 0.5) == pytest.approx(0.5)
-        assert score_tracker.ema_scores["hk_a"] == pytest.approx(0.5)
+        assert score_tracker.round_scores["hk_a"] == pytest.approx(0.5)
         assert score_tracker.last_raw_scores["hk_a"] == pytest.approx(0.5)
 
     def test_update_rejects_invalid_round_scores(self, score_tracker):
         for bad_score in (None, "nan", -0.1, 0.0, 1.1):
             with pytest.raises(ValueError):
                 score_tracker.update("hk_bad", bad_score)
-        assert "hk_bad" not in score_tracker.ema_scores
+        assert "hk_bad" not in score_tracker.round_scores
 
     def test_nine_of_twenty_is_not_eligible(self, score_tracker):
         _seed_participation(score_tracker, ["hk_a"], MIN_PARTICIPATION_ROUNDS - 1)
@@ -92,7 +92,7 @@ class TestRoundOnlyState:
         _record_scores(score_tracker, "r1", {"hk_a": 0.9, "hk_b": 0.7})
         _record_scores(score_tracker, "r2", {"hk_b": 0.8, "hk_c": 0.6})
 
-        assert set(score_tracker.ema_scores) == {"hk_b", "hk_c"}
+        assert set(score_tracker.round_scores) == {"hk_b", "hk_c"}
         assert score_tracker.get_participation_count("hk_a") == 1
         assert score_tracker.get_participation_count("hk_b") == 2
 
@@ -109,7 +109,7 @@ class TestRoundOnlyState:
             ],
         )
 
-        assert score_tracker.ema_scores == {}
+        assert score_tracker.round_scores == {}
         assert score_tracker.last_raw_scores == {}
         assert len(score_tracker.round_history) == MIN_PARTICIPATION_ROUNDS
         assert score_tracker.get_participation_count("hk_old") == MIN_PARTICIPATION_ROUNDS
@@ -202,25 +202,28 @@ class TestRoundOnlyWeights:
 
 
 class TestCanonicalTiebreak:
+    def test_canonical_tiebreak_window_is_one_tenth_percent(self):
+        assert CANONICAL_TIEBREAK_TOLERANCE == pytest.approx(0.001)
+
     def test_canonical_needed_for_close_current_round_scores(self, score_tracker):
         _seed_participation(
             score_tracker, ["hk_a", "hk_b"], MIN_PARTICIPATION_ROUNDS - 1
         )
-        _record_scores(score_tracker, "r1", {"hk_a": 0.700, "hk_b": 0.695})
+        _record_scores(score_tracker, "r1", {"hk_a": 0.7000, "hk_b": 0.6995})
         assert score_tracker.needs_canonical_tiebreak(["hk_a", "hk_b"])
 
     def test_canonical_not_needed_for_clear_current_round_winner(self, score_tracker):
         _seed_participation(
             score_tracker, ["hk_a", "hk_b"], MIN_PARTICIPATION_ROUNDS - 1
         )
-        _record_scores(score_tracker, "r1", {"hk_a": 0.700, "hk_b": 0.650})
+        _record_scores(score_tracker, "r1", {"hk_a": 0.700, "hk_b": 0.698})
         assert not score_tracker.needs_canonical_tiebreak(["hk_a", "hk_b"])
 
     def test_canonical_used_when_within_tolerance(self, score_tracker):
         _seed_participation(
             score_tracker, ["hk_a", "hk_b"], MIN_PARTICIPATION_ROUNDS - 1
         )
-        _record_scores(score_tracker, "r1", {"hk_a": 0.700, "hk_b": 0.695})
+        _record_scores(score_tracker, "r1", {"hk_a": 0.7000, "hk_b": 0.6995})
 
         weights = score_tracker.get_winner_heavy_pruning_dust_weights(
             ["hk_a", "hk_b"],

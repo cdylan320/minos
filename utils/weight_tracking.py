@@ -4,10 +4,9 @@ Round-only winner weighting.
 Each Minos round is a fresh genomics challenge, so validator weights should be
 computed from that round's finalized scores only. Miners must still have valid
 scores in at least 10 of the last 20 finalized rounds before they can receive
-winner/dust weight; the current round counts. The class keeps the historic
-``ema_scores`` attribute name in memory for surrounding validator code, but the
-platform ``ema_score`` payload field is intentionally left empty while EMA is
-disabled.
+winner/dust weight; the current round counts. The platform weight-history
+schema still has a legacy ``ema_score`` field, which is intentionally left empty
+for round-only scoring.
 
 Weight distribution is winner-heavy: the top eligible current-round miner
 receives the configured winner weight, ranks #2..N receive pruning dust, and the
@@ -27,18 +26,15 @@ logger = logging.getLogger(__name__)
 # current round is appended before weights are computed, so it counts.
 PARTICIPATION_WINDOW = int(os.getenv("PARTICIPATION_WINDOW", "20"))
 MIN_PARTICIPATION_ROUNDS = int(os.getenv("MIN_PARTICIPATION_ROUNDS", "10"))
-DEFAULT_DECAY_FACTOR = 1.0
 
-# Scores within this epsilon are treated as tied; tiebreak by earliest
-# submission timestamp.
-SCORE_EPSILON = 0.005
+# Equal current-round scores are tied by earliest submission timestamp.
 ROUND_SCORE_TOLERANCE = 1e-9
-EMA_TOLERANCE = ROUND_SCORE_TOLERANCE
 
 # Canonical-ranking tiebreak. When a canonical candidate is within this absolute
 # current-round score gap of local rank 1, the canonical candidate is used as the
-# winner. This keeps validators aligned on close rounds.
-CANONICAL_TIEBREAK_TOLERANCE = 0.02
+# winner. This keeps validators aligned on very close rounds without overriding
+# clear local score differences.
+CANONICAL_TIEBREAK_TOLERANCE = 0.001
 
 # Minimum canonical coverage. Platform contributors below the per-validator
 # stake floor are excluded, and the validator requires enough distinct
@@ -60,28 +56,16 @@ class ScoreTracker:
 
     Miners are identified by hotkey (ss58 address) for stability across
     metagraph resyncs. UID mapping happens at weight-setting time.
-
-    ``ema_scores`` is intentionally retained as the public attribute used by
-    surrounding validator code. It now stores the current round's
-    combined_final score; platform history still receives ``ema_score=None``.
     """
 
     def __init__(
         self,
-        alpha: float = None,
         min_rounds: int = MIN_PARTICIPATION_ROUNDS,
-        decay_factor: float = None,
     ):
-        # Compatibility only. Round-only scoring intentionally ignores EMA
-        # smoothing and decay; min_rounds is a recent-window eligibility gate.
-        self.alpha = alpha if alpha is not None else float(os.getenv("EMA_ALPHA", "1.0"))
         self.min_rounds = min_rounds
-        self.decay_factor = decay_factor if decay_factor is not None else float(
-            os.getenv("EMA_DECAY_FACTOR", str(DEFAULT_DECAY_FACTOR))
-        )
 
         # hotkey -> current round score
-        self.ema_scores: Dict[str, float] = {}
+        self.round_scores: Dict[str, float] = {}
 
         # hotkey -> current round raw score (same value, explicit for reporting)
         self.last_raw_scores: Dict[str, float] = {}
@@ -93,7 +77,7 @@ class ScoreTracker:
 
     def recover_from_platform_state(
         self,
-        ema_entries: List[Dict[str, Any]],
+        legacy_score_entries: List[Dict[str, Any]],
         round_history: List[Dict[str, Any]],
     ):
         """Start fresh on scores while recovering recent participation.
@@ -105,7 +89,7 @@ class ScoreTracker:
         /v2/get-submissions, which returns already-submitted scores for that
         round.
         """
-        self.ema_scores.clear()
+        self.round_scores.clear()
         self.last_raw_scores.clear()
         self.round_history = []
         self._recorded_round_ids = set()
@@ -127,7 +111,7 @@ class ScoreTracker:
         self._recalculate_participation()
         logger.info(
             "Round-only score tracker initialized fresh; ignored "
-            f"{len(ema_entries or [])} historical score entries and recovered "
+            f"{len(legacy_score_entries or [])} historical score entries and recovered "
             f"{len(self.round_history)} recent participation rounds"
         )
 
@@ -139,7 +123,7 @@ class ScoreTracker:
             raise ValueError(f"Invalid round score for {hotkey[:16]}...: {raw_score!r}")
         if not math.isfinite(score) or score <= 0.0 or score > 1.0:
             raise ValueError(f"Round score out of range for {hotkey[:16]}...: {score!r}")
-        self.ema_scores[hotkey] = score
+        self.round_scores[hotkey] = score
         self.last_raw_scores[hotkey] = score
         return score
 
@@ -154,15 +138,15 @@ class ScoreTracker:
             return
 
         scored_set = set(scored_hotkeys)
-        self.ema_scores = {
-            hk: score for hk, score in self.ema_scores.items() if hk in scored_set
+        self.round_scores = {
+            hk: score for hk, score in self.round_scores.items() if hk in scored_set
         }
         self.last_raw_scores = {
             hk: score for hk, score in self.last_raw_scores.items() if hk in scored_set
         }
 
         counted_hotkeys = {
-            hk for hk in scored_set if self.ema_scores.get(hk, 0.0) > 0.0
+            hk for hk in scored_set if self.round_scores.get(hk, 0.0) > 0.0
         }
 
         self.round_history.append({
@@ -193,16 +177,16 @@ class ScoreTracker:
         """Return whether a miner has met the recent-window round threshold."""
         return self.get_participation_count(hotkey) >= self.min_rounds
 
-    def _sort_by_ema(
+    def _sort_by_round_score(
         self,
         hotkeys: List[str],
         submission_times: Optional[Dict[str, float]] = None,
-        tolerance: float = EMA_TOLERANCE,
+        tolerance: float = ROUND_SCORE_TOLERANCE,
     ) -> List[str]:
         """Sort by current-round score descending, then earliest submission."""
         def _cmp(hk_a, hk_b):
-            sa = self.ema_scores.get(hk_a, 0.0)
-            sb = self.ema_scores.get(hk_b, 0.0)
+            sa = self.round_scores.get(hk_a, 0.0)
+            sb = self.round_scores.get(hk_b, 0.0)
             ta = submission_times.get(hk_a, float("inf")) if submission_times else float("inf")
             tb = submission_times.get(hk_b, float("inf")) if submission_times else float("inf")
             if abs(sa - sb) <= tolerance:
@@ -219,10 +203,10 @@ class ScoreTracker:
         """Return eligible current-round scored miners with positive scores."""
         eligible = [hk for hk in miner_hotkeys if self.is_eligible(hk)]
         return [
-            hk for hk in self._sort_by_ema(
+            hk for hk in self._sort_by_round_score(
                 eligible, submission_times, tolerance=ROUND_SCORE_TOLERANCE
             )
-            if self.ema_scores.get(hk, 0.0) > 0
+            if self.round_scores.get(hk, 0.0) > 0
         ]
 
     def needs_canonical_tiebreak(
@@ -235,9 +219,9 @@ class ScoreTracker:
         if len(ranked) < 2:
             return False
 
-        top_score = self.ema_scores.get(ranked[0], 0.0)
+        top_score = self.round_scores.get(ranked[0], 0.0)
         return any(
-            (top_score - self.ema_scores.get(hk, 0.0))
+            (top_score - self.round_scores.get(hk, 0.0))
             <= CANONICAL_TIEBREAK_TOLERANCE + ROUND_SCORE_TOLERANCE
             for hk in ranked[1:]
         )
@@ -297,14 +281,14 @@ class ScoreTracker:
 
         if canonical_candidates:
             ranked_set = set(ranked)
-            top_score = self.ema_scores.get(ranked[0], 0.0)
+            top_score = self.round_scores.get(ranked[0], 0.0)
             for candidate in canonical_candidates:
                 if candidate not in ranked_set:
                     continue
                 if candidate == ranked[0]:
                     winner = candidate
                     break
-                canonical_score = self.ema_scores.get(candidate, 0.0)
+                canonical_score = self.round_scores.get(candidate, 0.0)
                 gap = top_score - canonical_score
                 if gap <= CANONICAL_TIEBREAK_TOLERANCE + ROUND_SCORE_TOLERANCE:
                     winner = candidate
@@ -359,8 +343,8 @@ class ScoreTracker:
             entries.append({
                 "miner_hotkey": hk,
                 "raw_score": self.last_raw_scores.get(hk),
-                # EMA is disabled for round-only scoring. Keep the field for
-                # schema compatibility, but do not backfill it with raw score.
+                # Legacy platform schema field. Round-only scoring leaves it
+                # empty rather than mirroring the current score.
                 "ema_score": None,
                 "rank": rankings.get(hk),
                 "weight": weights.get(hk, 0.0),
@@ -372,18 +356,14 @@ class ScoreTracker:
 
     def get_stats(self) -> Dict[str, Any]:
         """Get current round statistics for logging."""
-        all_hotkeys = list(self.ema_scores.keys())
-        score_values = list(self.ema_scores.values())
+        all_hotkeys = list(self.round_scores.keys())
+        score_values = list(self.round_scores.values())
 
         return {
             "total_miners_tracked": len(all_hotkeys),
             "eligible_count": sum(1 for hk in all_hotkeys if self.is_eligible(hk)),
             "rounds_tracked": len(self.round_history),
             "min_rounds_required": self.min_rounds,
-            "ema_alpha": None,
-            "decay_factor": None,
-            "top_ema": max(score_values) if score_values else 0.0,
-            "mean_ema": sum(score_values) / len(score_values) if score_values else 0.0,
             "top_round_score": max(score_values) if score_values else 0.0,
             "mean_round_score": sum(score_values) / len(score_values) if score_values else 0.0,
         }

@@ -1,0 +1,197 @@
+name: Minos SN107 Public Knowledge Graph
+version: 1.0.0
+description: Public-safe Minos subnet 107 knowledge pack for miners, validators, and agent runtimes.
+canonical_source: docs/ai-assistant/memory-pack
+privacy: public_only
+published_providers:
+  ditto:
+    handle: "@minos"
+    graph_name: Minos SN107 Public Knowledge Graph
+    profile: https://share.heyditto.ai/@minos
+    subscription_script: scripts/setup_ditto_agent.sh
+
+bootstrap:
+  minosvm_first_run: bash scripts/minosvm_first_run.sh
+  prompt: bash scripts/prompt_ai_assistant.sh
+  ditto_only: bash scripts/setup_ditto_agent.sh
+  guided_ai_assistant: bash scripts/setup_ai_assistant.sh
+  start_miner_ditto: bash start-miner.sh --setup-ditto
+  start_miner_ai_assistant: bash start-miner.sh --setup-ai-assistant
+
+runtime_assets:
+  portable_skill: docs/ai-assistant/minos-miner-skill
+  openclaw_workspace_templates: docs/ai-assistant/openclaw-workspace
+  hermes_soul_template: docs/ai-assistant/hermes/SOUL.minos-miner-template.md
+  model_provider_setup: docs/ai-assistant/model-provider-setup.md
+
+template_targets:
+  ditto:
+    provider: Ditto
+    name: Minos SN107 Public Knowledge Graph
+    purpose: Public support memory for Minos subnet 107 miners, validators, and agent runtimes.
+    update_model: public_knowledge_graph_subscription
+    fallback_model: private_agent_memory_seed_from_graph_seed_order
+  mcp:
+    provider: Minos MCP
+    purpose: Public live-data tool layer paired with the same Minos knowledge pack.
+    update_model: live_public_tools_plus_versioned_public_resources
+
+graph_seed_order:
+  - quickstart.md
+  - protocol-rules-and-rewards.md
+  - validator-guide.md
+  - scoring-and-advancedscorer.md
+  - hardware-and-runtime.md
+  - live-data-boundary.md
+  - troubleshooting.md
+  - endpoint-safety.md
+  - glossary.md
+  - config-tuning.md
+  - agent-instruction.md
+  - cards/what-minos-is.md
+  - cards/variant-calling-basics.md
+  - cards/bam-vcf-reference-reads.md
+  - cards/snp-indel.md
+  - cards/miner-lifecycle.md
+  - cards/demo-mode.md
+  - cards/live-mining-registration.md
+  - cards/pm2-docker-runtime.md
+  - cards/public-endpoint-diagnostics.md
+  - cards/scoring-basics.md
+  - cards/rewards-eligibility-weight.md
+  - cards/gatk-basics.md
+  - cards/deepvariant-basics.md
+  - cards/bcftools-basics.md
+  - cards/safe-tuning-workflow.md
+  - cards/validator-basics.md
+  - cards/validator-safety.md
+  - cards/safe-pasteback-template.md
+  - cards/live-data-boundary.md
+  - cards/assistant-runtime-tools.md
+
+maintainer_only:
+  - evals.md
+
+subjects:
+  - Minos SN107
+  - Public knowledge graph
+  - Miner onboarding
+  - Demo mode
+  - Live mining
+  - Bittensor wallet and hotkey
+  - Docker runtime
+  - PM2 supervision
+  - Variant calling
+  - BAM files
+  - VCF files
+  - Reference genome and reads
+  - SNPs and indels
+  - GATK
+  - DeepVariant
+  - BCFtools
+  - hap.py benchmarking
+  - AdvancedScorer
+  - Scoring basics
+  - Protocol rules
+  - Rewards and emissions
+  - Eligibility and weight
+  - Validators
+  - Validator setup
+  - Validator safety
+  - Public endpoints
+  - Endpoint safety
+  - Troubleshooting
+  - Config tuning
+  - Hardware requirements
+  - Runtime operations
+  - Safe paste-back
+  - Safe support behavior
+  - Live data boundary
+  - How to compete well
+  - Miner monitoring
+  - Assistant runtimes
+  - Ditto
+  - Minos MCP
+  - OpenClaw
+  - Hermes
+
+subject_links:
+  Minos SN107:
+    related:
+      - Miner onboarding
+      - Validators
+      - Protocol rules
+      - Public knowledge graph
+  Miner onboarding:
+    related:
+      - Demo mode
+      - Live mining
+      - Bittensor wallet and hotkey
+      - Docker runtime
+      - PM2 supervision
+      - Troubleshooting
+  Variant calling:
+    related:
+      - BAM files
+      - VCF files
+      - Reference genome and reads
+      - SNPs and indels
+      - GATK
+      - DeepVariant
+      - BCFtools
+      - hap.py benchmarking
+      - Scoring basics
+  Scoring basics:
+    related:
+      - AdvancedScorer
+      - Rewards and emissions
+      - Eligibility and weight
+      - Protocol rules
+      - How to compete well
+  Validators:
+    related:
+      - Validator setup
+      - Validator safety
+      - hap.py benchmarking
+      - AdvancedScorer
+      - Protocol rules
+  Public endpoints:
+    related:
+      - Endpoint safety
+      - Live data boundary
+      - Miner monitoring
+      - Minos MCP
+      - Troubleshooting
+  Assistant runtimes:
+    related:
+      - Ditto
+      - Minos MCP
+      - OpenClaw
+      - Hermes
+      - Public knowledge graph
+
+hard_exclusions:
+  - seed phrases
+  - private keys
+  - .env values
+  - API keys
+  - model provider API keys
+  - SSH keys
+  - database credentials
+  - authorization headers
+  - request signatures
+  - active nonces
+  - presigned URLs
+  - private miner configs
+  - private BAM files
+  - private VCF files
+  - private challenge data
+  - truth files
+  - confident region files
+  - private validator files
+  - private benchmark data
+  - admin endpoints
+  - cloud bucket credentials
+  - private bucket names
+  - private production infrastructure details
+  - guaranteed winning config claims

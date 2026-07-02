@@ -21,9 +21,6 @@ BASE_DIR = Path(__file__).parent.parent  # project root (parent of base/)
 
 # Genomics task configuration
 GENOMICS_CONFIG = {
-    # Scoring parameters
-    "ema_alpha": 0.1,  # EMA smoothing factor (used by ScoreTracker)
-
     # Docker settings
     "happy_docker_image": "genonet/hap-py@sha256:03acabe84bbfba35f5a7234129d524c563f5657e1f21150a2ea2797f8e6d05f2",
 

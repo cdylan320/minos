@@ -15,7 +15,10 @@ FLAG_WALLET_HOTKEY=""
 FLAG_MINER_TEMPLATE=""
 FLAG_STORAGE=""
 FLAG_DEMO=false
+FLAG_SETUP_DITTO=false
+FLAG_SETUP_AI_ASSISTANT=false
 RUN_SETUP=false
+CREATED_OR_UPDATED_ENV=false
 
 show_help() {
     echo "Usage: bash start-miner.sh [OPTIONS]"
@@ -27,6 +30,8 @@ show_help() {
     echo "  --storage <backend>         Fetch order: hippius (default) or aws_s3 (R2/AWS first)"
     echo "  --demo                      Run against the platform's /v2/demo/* sandbox"
     echo "                              (no wallet needed, no chain connection, no TAO earned)"
+    echo "  --setup-ditto               Subscribe Ditto to the public @minos knowledge graph"
+    echo "  --setup-ai-assistant        Open the Minos assistant setup menu"
     echo "  --setup                     Re-run interactive setup wizard"
     echo "  --help                      Show this help message"
     echo ""
@@ -34,23 +39,79 @@ show_help() {
     echo "  bash start-miner.sh                                    # First run: interactive setup"
     echo "  bash start-miner.sh --wallet-name miner --miner-template deepvariant"
     echo "  bash start-miner.sh --demo                             # Test pipeline without registering"
+    echo "  bash start-miner.sh --setup-ditto                      # Add optional Ditto @minos knowledge"
+    echo "  bash start-miner.sh --setup-ai-assistant               # Choose assistant setup; MinosVM offers OpenClaw/Hermes or skip"
     echo "  bash start-miner.sh --setup                            # Re-run setup wizard"
     echo "  bash start-miner.sh --miner-template bcftools          # Change tool and restart"
     exit 0
 }
 
+require_value() {
+    local flag="$1"
+    local value="${2:-}"
+    if [ -z "$value" ] || [[ "$value" == --* ]]; then
+        echo -e "${RED}Missing value for $flag${NC}" >&2
+        echo "Run with --help for usage." >&2
+        exit 1
+    fi
+}
+
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --wallet-name) FLAG_WALLET_NAME="$2"; shift 2 ;;
-        --wallet-hotkey) FLAG_WALLET_HOTKEY="$2"; shift 2 ;;
-        --miner-template) FLAG_MINER_TEMPLATE="$2"; shift 2 ;;
-        --storage) FLAG_STORAGE="$2"; shift 2 ;;
+        --wallet-name) require_value "$1" "${2:-}"; FLAG_WALLET_NAME="$2"; shift 2 ;;
+        --wallet-hotkey) require_value "$1" "${2:-}"; FLAG_WALLET_HOTKEY="$2"; shift 2 ;;
+        --miner-template) require_value "$1" "${2:-}"; FLAG_MINER_TEMPLATE="$2"; shift 2 ;;
+        --storage) require_value "$1" "${2:-}"; FLAG_STORAGE="$2"; shift 2 ;;
         --demo) FLAG_DEMO=true; shift ;;
+        --setup-ditto) FLAG_SETUP_DITTO=true; shift ;;
+        --setup-ai-assistant) FLAG_SETUP_AI_ASSISTANT=true; shift ;;
         --setup) RUN_SETUP=true; shift ;;
         --help|-h) show_help ;;
         *) echo -e "${RED}Unknown option: $1${NC}"; echo "Run with --help for usage."; exit 1 ;;
     esac
 done
+
+if [ "$FLAG_SETUP_DITTO" = true ]; then
+    DITTO_SETUP_SCRIPT="scripts/setup_ditto_agent.sh"
+    if [ ! -f "$DITTO_SETUP_SCRIPT" ]; then
+        echo -e "${RED}Ditto setup script not found: $DITTO_SETUP_SCRIPT${NC}"
+        exit 1
+    fi
+    exec bash "$DITTO_SETUP_SCRIPT" --yes
+fi
+
+if [ "$FLAG_SETUP_AI_ASSISTANT" = true ]; then
+    AI_ASSISTANT_PROMPT_SCRIPT="scripts/prompt_ai_assistant.sh"
+    if [ ! -f "$AI_ASSISTANT_PROMPT_SCRIPT" ]; then
+        echo -e "${RED}AI assistant setup script not found: $AI_ASSISTANT_PROMPT_SCRIPT${NC}"
+        exit 1
+    fi
+    if [ -f /opt/minosvm_venv/bin/activate ]; then
+        exec bash "$AI_ASSISTANT_PROMPT_SCRIPT" --prompt --default y --role minosvm --runtime-only
+    fi
+    exec bash "$AI_ASSISTANT_PROMPT_SCRIPT" --prompt --default y --role manual
+fi
+
+maybe_prompt_ai_assistant() {
+    local prompt_script
+    if [ "$CREATED_OR_UPDATED_ENV" != true ]; then
+        return
+    fi
+    if [ "$DEMO_INTENT" = true ]; then
+        return
+    fi
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        return
+    fi
+    prompt_script="scripts/prompt_ai_assistant.sh"
+    if [ -f "$prompt_script" ]; then
+        if [ -f /opt/minosvm_venv/bin/activate ]; then
+            bash "$prompt_script" --prompt --once --default y --role minosvm --runtime-only || true
+            return
+        fi
+        bash "$prompt_script" --prompt --once --default y --role miner || true
+    fi
+}
 
 # --- Check prerequisites ---
 
@@ -75,22 +136,60 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-# 3. Reference data
-REF_CHECK=""
-if [ -f datasets/reference/chr20/chr20.fa ]; then
-    REF_CHECK="new"
-elif [ -f datasets/reference/chr20.fa ]; then
-    REF_CHECK="legacy"
-fi
-
-if [ -z "$REF_CHECK" ]; then
-    echo -e "${RED}Reference data not found.${NC}"
-    echo "  Run: bash install.sh"
-    exit 1
-fi
-
 # Activate venv
 source "$VENV/bin/activate"
+
+ensure_runtime_assets() {
+    local ref_ok=false
+    local missing=0
+    local template="${MINER_TEMPLATE:-gatk}"
+    local images=()
+    local image
+
+    if [ -f datasets/reference/chr20/chr20.fa ] || [ -f datasets/reference/chr20.fa ]; then
+        ref_ok=true
+    fi
+
+    case "$template" in
+        gatk)
+            images=(
+                "broadinstitute/gatk:4.5.0.0"
+                "quay.io/biocontainers/samtools:1.20--h50ea8bc_0"
+                "quay.io/biocontainers/bcftools:1.20--h8b25389_0"
+            )
+            ;;
+        deepvariant)
+            images=("google/deepvariant:1.5.0")
+            ;;
+        bcftools)
+            images=("quay.io/biocontainers/bcftools:1.20--h8b25389_0")
+            ;;
+    esac
+
+    for image in "${images[@]}"; do
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            missing=$((missing + 1))
+        fi
+    done
+
+    if [ "$ref_ok" = true ] && [ "$missing" -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}Required Minos runtime assets are missing; downloading them automatically.${NC}"
+    if [ "$ref_ok" != true ]; then
+        echo "  - reference data"
+    fi
+    if [ "$missing" -gt 0 ]; then
+        echo "  - ${missing} Docker image(s) for ${template}"
+    fi
+
+    if ! python setup.py --update-data-only; then
+        echo -e "${RED}Could not download required runtime assets.${NC}"
+        echo "  Retry: python setup.py --update-data-only"
+        exit 1
+    fi
+}
 
 # --- Compute demo intent from flag AND env var (must happen BEFORE .env is
 # sourced, so MINER_DEMO from the parent shell environment is honored even
@@ -111,6 +210,39 @@ fi
 if [ -f .env ]; then
     set -a; source .env; set +a
 fi
+
+set_env_value() {
+    local key="$1"
+    local value="$2"
+    local escaped_value
+
+    escaped_value="$(printf '%s' "$value" | sed 's/[\/&]/\\&/g')"
+    if grep -q "^${key}=" .env; then
+        sed -i.bak "s/^${key}=.*/${key}=${escaped_value}/" .env && rm -f .env.bak
+    else
+        printf '%s=%s\n' "$key" "$value" >> .env
+    fi
+}
+
+first_existing_wallet_hotkey() {
+    local wallet_root="$HOME/.bittensor/wallets"
+    local wallet_path hotkey_path wallet_name hotkey_name
+
+    [ -d "$wallet_root" ] || return 1
+
+    for wallet_path in "$wallet_root"/*; do
+        [ -d "$wallet_path" ] || continue
+        wallet_name="$(basename "$wallet_path")"
+        for hotkey_path in "$wallet_path"/hotkeys/*; do
+            [ -f "$hotkey_path" ] || continue
+            hotkey_name="$(basename "$hotkey_path")"
+            printf '%s\t%s\n' "$wallet_name" "$hotkey_name"
+            return 0
+        done
+    done
+
+    return 1
+}
 
 # --- Demo fast-path: any signal of demo intent + no .env → skip wallet wizard ---
 # The demo flow uses an ephemeral keypair generated inside the Python miner,
@@ -164,12 +296,12 @@ if [ -f .env ] && [ "$RUN_SETUP" = false ]; then
     CHANGED=false
 
     if [ -n "$FLAG_WALLET_NAME" ]; then
-        sed -i.bak "s/^WALLET_NAME=.*/WALLET_NAME=$FLAG_WALLET_NAME/" .env && rm -f .env.bak
+        set_env_value "WALLET_NAME" "$FLAG_WALLET_NAME"
         WALLET_NAME="$FLAG_WALLET_NAME"
         CHANGED=true
     fi
     if [ -n "$FLAG_WALLET_HOTKEY" ]; then
-        sed -i.bak "s/^WALLET_HOTKEY=.*/WALLET_HOTKEY=$FLAG_WALLET_HOTKEY/" .env && rm -f .env.bak
+        set_env_value "WALLET_HOTKEY" "$FLAG_WALLET_HOTKEY"
         WALLET_HOTKEY="$FLAG_WALLET_HOTKEY"
         CHANGED=true
     fi
@@ -185,12 +317,12 @@ if [ -f .env ] && [ "$RUN_SETUP" = false ]; then
                 exit 1
                 ;;
         esac
-        sed -i.bak "s/^MINER_TEMPLATE=.*/MINER_TEMPLATE=$FLAG_MINER_TEMPLATE/" .env && rm -f .env.bak
+        set_env_value "MINER_TEMPLATE" "$FLAG_MINER_TEMPLATE"
         MINER_TEMPLATE="$FLAG_MINER_TEMPLATE"
         CHANGED=true
     fi
     if [ -n "$FLAG_STORAGE" ]; then
-        sed -i.bak "s/^STORAGE_PRIMARY_BACKEND=.*/STORAGE_PRIMARY_BACKEND=$FLAG_STORAGE/" .env && rm -f .env.bak
+        set_env_value "STORAGE_PRIMARY_BACKEND" "$FLAG_STORAGE"
         STORAGE_PRIMARY_BACKEND="$FLAG_STORAGE"
         CHANGED=true
     fi
@@ -207,6 +339,14 @@ fi
 # direct `MINER_DEMO=true bash start-miner.sh` invocations).
 
 if { [ ! -f .env ] || [ "$RUN_SETUP" = true ]; } && [ "$DEMO_INTENT" = false ]; then
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo -e "${RED}Miner setup needs an interactive terminal because .env is missing or --setup was requested.${NC}"
+        echo "  Run manually: bash start-miner.sh --setup"
+        echo "  Demo mode:    bash start-miner.sh --demo"
+        echo "  PM2 live mode requires .env first: bash start-miner.sh --setup, then bash pm2-miner.sh"
+        exit 1
+    fi
+
     # Use flag values or existing .env values as defaults
     DEFAULT_WALLET_NAME="${FLAG_WALLET_NAME:-${WALLET_NAME:-default}}"
     DEFAULT_WALLET_HOTKEY="${FLAG_WALLET_HOTKEY:-${WALLET_HOTKEY:-default}}"
@@ -222,13 +362,38 @@ if { [ ! -f .env ] || [ "$RUN_SETUP" = true ]; } && [ "$DEMO_INTENT" = false ]; 
     echo -e "${NC}"
 
     # Wallet setup
+    SKIP_WALLET_MENU=false
     echo -e "${BLUE}[1/2] Wallet setup:${NC}"
-    echo "  1) Create new wallet"
-    echo "  2) Import wallet (mnemonic)"
-    echo "  3) Use existing wallet"
-    read -p "  Choice (1/2/3): " WALLET_CHOICE
+    if [ -z "$FLAG_WALLET_NAME" ] && [ -z "$FLAG_WALLET_HOTKEY" ]; then
+        DETECTED_PAIR="$(first_existing_wallet_hotkey || true)"
+        if [ -n "$DETECTED_PAIR" ]; then
+            DETECTED_WALLET="${DETECTED_PAIR%%	*}"
+            DETECTED_HOTKEY="${DETECTED_PAIR#*	}"
+            echo -e "  Detected wallet: ${GREEN}${DETECTED_WALLET}/${DETECTED_HOTKEY}${NC}"
+            read -p "  Use this wallet for live mining? [Y/n]: " USE_DETECTED
+            USE_DETECTED="${USE_DETECTED:-y}"
+            case "$USE_DETECTED" in
+                y|Y|yes|YES)
+                    WALLET_NAME="$DETECTED_WALLET"
+                    HOTKEY_NAME="$DETECTED_HOTKEY"
+                    SKIP_WALLET_MENU=true
+                    echo -e "  Using wallet: ${GREEN}$WALLET_NAME/$HOTKEY_NAME${NC}"
+                    ;;
+            esac
+        fi
+    fi
 
-    if [ "$WALLET_CHOICE" = "3" ]; then
+    if [ "$SKIP_WALLET_MENU" != true ]; then
+        echo "  1) Create new wallet"
+        echo "  2) Import wallet (mnemonic)"
+        echo "  3) Use existing wallet"
+        read -p "  Choice (1/2/3) [3]: " WALLET_CHOICE
+        WALLET_CHOICE="${WALLET_CHOICE:-3}"
+    fi
+
+    if [ "$SKIP_WALLET_MENU" = true ]; then
+        :
+    elif [ "$WALLET_CHOICE" = "3" ]; then
         # Auto-detect wallets from ~/.bittensor/wallets/
         WALLET_DIR="$HOME/.bittensor/wallets"
         if [ -d "$WALLET_DIR" ] && [ "$(ls -A "$WALLET_DIR" 2>/dev/null)" ]; then
@@ -239,6 +404,9 @@ if { [ ! -f .env ] || [ "$RUN_SETUP" = true ]; } && [ "$DEMO_INTENT" = false ]; 
                 echo "    $((i+1))) ${WALLETS[$i]}"
             done
             read -p "  Select wallet (1-${#WALLETS[@]}): " W_IDX
+            if ! [[ "$W_IDX" =~ ^[0-9]+$ ]] || [ "$W_IDX" -lt 1 ] || [ "$W_IDX" -gt "${#WALLETS[@]}" ]; then
+                W_IDX=1
+            fi
             WALLET_NAME="${WALLETS[$((W_IDX-1))]}"
             WALLET_NAME=${WALLET_NAME:-${WALLETS[0]}}
 
@@ -256,6 +424,9 @@ if { [ ! -f .env ] || [ "$RUN_SETUP" = true ]; } && [ "$DEMO_INTENT" = false ]; 
                         echo "    $((i+1))) ${HOTKEYS[$i]}"
                     done
                     read -p "  Select hotkey (1-${#HOTKEYS[@]}): " H_IDX
+                    if ! [[ "$H_IDX" =~ ^[0-9]+$ ]] || [ "$H_IDX" -lt 1 ] || [ "$H_IDX" -gt "${#HOTKEYS[@]}" ]; then
+                        H_IDX=1
+                    fi
                     HOTKEY_NAME="${HOTKEYS[$((H_IDX-1))]}"
                     HOTKEY_NAME=${HOTKEY_NAME:-${HOTKEYS[0]}}
                 fi
@@ -327,10 +498,27 @@ EOF
 
     echo -e "${GREEN}.env created${NC}"
     echo ""
+    CREATED_OR_UPDATED_ENV=true
 
     # Reload
     set -a; source .env; set +a
 fi
+
+MINER_DEMO_LC="$(printf '%s' "${MINER_DEMO:-}" | tr '[:upper:]' '[:lower:]')"
+case "$MINER_DEMO_LC" in 1|true|yes|on) MINER_DEMO_FLAG=true ;; *) MINER_DEMO_FLAG=false ;; esac
+if [ "$FLAG_DEMO" = true ] || [ "$MINER_DEMO_FLAG" = true ]; then
+    DEMO_INTENT=true
+else
+    DEMO_INTENT=false
+fi
+
+if [ -f .env ] && [ -z "${MINER_TEMPLATE:-}" ]; then
+    MINER_TEMPLATE="gatk"
+    set_env_value "MINER_TEMPLATE" "$MINER_TEMPLATE"
+fi
+
+ensure_runtime_assets
+maybe_prompt_ai_assistant
 
 # Portable lowercase (works on macOS bash 3.2 — ${VAR,,} is bash 4+).
 # Accepted values match the Python miner's env parser (1|true|yes|on) so

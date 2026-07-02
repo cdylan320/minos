@@ -87,6 +87,23 @@ def slice_truth_vcf(source_vcf: Path, target_vcf: Path, region: str) -> bool:
         if not index_csi.exists() and not index_tbi.exists():
             logger.warning(f"VCF not indexed, extraction will be slow")
 
+        try:
+            reindex = subprocess.run(
+                ["tabix", "-p", "vcf", "-f", str(source_vcf)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if reindex.returncode != 0:
+                logger.warning(
+                    f"tabix reindex failed for {source_vcf.name} "
+                    f"(continuing): {reindex.stderr.strip()}"
+                )
+        except FileNotFoundError:
+            logger.warning("tabix not on PATH; skipping defensive reindex")
+        except subprocess.TimeoutExpired:
+            logger.warning(f"tabix reindex timeout for {source_vcf.name}")
+
         source_dir = source_vcf.parent
         target_dir = target_vcf.parent
 

@@ -34,7 +34,7 @@ MINERS
 VALIDATORS
   │  Poll /v2/get-scoring-rounds → get all miner submissions
   │  For each miner: re-run their exact tool_config → score VCF with hap.py
-  │  Submit scores to platform → compute EMA → set weights on chain
+  │  Submit scores to platform → compute round weights → set weights on chain
   │
   ▼ status: "completed"
 ```
@@ -115,20 +115,20 @@ while True:
         with bounded_concurrency(N=auto):
             for miner in score_in_parallel(assignment.primary):
                 submit_score(miner)             # per-miner score + artifact pointers
-                update_ema(miner.hotkey, miner.combined_final)
+                update_round_score(miner.hotkey, miner.combined_final)
             if not approaching_deadline():
                 for miner in score_in_parallel(assignment.secondary):
                     submit_score(miner)
-                    update_ema(miner.hotkey, miner.combined_final)
+                    update_round_score(miner.hotkey, miner.combined_final)
 
         # After scoring window closes: fetch peer scores for gap miners,
         # then record participation once using personal + backfilled hotkeys.
         backfill = get_backfill_scores(round)   # commit-then-reveal
         for entry in backfill:
-            update_ema(entry.hotkey, entry.score)
+            update_round_score(entry.hotkey, entry.score)
         record_round(personal_hotkeys + backfill_hotkeys)
 
-        weights = compute_weights()             # warmup split or winner-heavy pruning dust
+        weights = compute_weights()             # winner-heavy pruning dust
         submit_weight_history(weights)          # platform dashboard/audit
         if registered_on_subnet:
             set_weights_on_chain(weights)       # Bittensor chain write
@@ -152,14 +152,13 @@ hap.py computes SNP and INDEL precision/recall against the truth VCF. The `Advan
 
 SNP/INDEL weighting is truth-count-proportional (fallback: 70/30).
 
-### 5.2 Weight assignment (EMA + winner-heavy pruning dust)
+### 5.2 Weight assignment (round-only winner-heavy pruning dust)
 
-- Each scored round updates each miner's EMA: `ema = α × score + (1−α) × ema` (α = 0.1); EMA starts at 0 so the first round yields 10% of the first score
-- Miners must participate in ≥ 10 of the last 20 rounds to be eligible for weights
-- Missed rounds decay the EMA by 0.95× per missed round
-- **Warmup phase** (before any miner reaches 10 rounds): the non-burn miner budget is split 50/30/20 among the top 3 active miners with positive EMA; the split is renormalized if fewer than three qualify; tiebreak by earliest config submission time
-- **Normal phase** (once any miner reaches eligibility): 87% goes to the burn UID, the highest-EMA eligible miner receives 10%, and the remaining 3% is distributed as ranked pruning dust across eligible ranks #2 through #10 using geometric decay; tiebreak by earliest config submission time
+- Each scored round is ranked from that round's normalized AdvancedScorer result only; historical scores do not carry into winner selection
+- Miners must participate in ≥ 10 of the last 20 rounds to be eligible for weights; the current round counts
 - Miners below the participation threshold receive 0 weight
+- 87% goes to the burn UID, the highest-scoring eligible current-round miner receives 10%, and the remaining 3% is distributed as ranked pruning dust across eligible ranks #2 through #10 using geometric decay
+- Close current-round ties use deterministic submission/canonical-ranking signals so validators converge on the same winner
 
 ---
 
@@ -171,7 +170,7 @@ SNP/INDEL weighting is truth-count-proportional (fallback: 70/30).
 | **Synthetic mutations** | HelixForge inserts mutations at positions unknown to miners; GIAB alone is insufficient to score well |
 | **Keypair authentication** | Every API call is signed with the Bittensor wallet keypair — submissions cannot be spoofed |
 | **Infrastructure stripping** | `threads`, `memory_gb`, `timeout`, `ref_build`, `num_threads` are removed from submitted configs — only quality parameters count |
-| **Winner-takes-all** | Only one miner earns rewards per round — copying another miner's config yields zero differentiation |
+| **Winner-heavy rewards** | The top eligible miner receives the main reward share; eligible ranks #2-#10 receive pruning dust, so copied configs still need differentiated current-round performance |
 
 ---
 
@@ -193,7 +192,7 @@ minos_subnet/
 │   └── tool_params.py     # Parameter definitions and validation
 ├── utils/
 │   ├── scoring.py         # hap.py Docker runner + AdvancedScorer
-│   ├── weight_tracking.py # EMA score tracker + winner-heavy pruning dust weights
+│   ├── weight_tracking.py # Round score tracker + winner-heavy pruning dust weights
 │   ├── platform_client.py # Authenticated API client (miner + validator)
 │   ├── subset_scoring.py  # Subset scoring helpers (assignments, deadlines)
 │   ├── config_loader.py   # Tool config file parser
@@ -201,7 +200,7 @@ minos_subnet/
 │   ├── file_utils.py      # SHA256-verified file download + caching
 │   └── README.md          # Utils documentation
 ├── base/
-│   └── genomics_config.py # Central config (Docker images, timeouts, EMA params)
+│   └── genomics_config.py # Central config (Docker images, timeouts, scoring params)
 ├── configs/
 │   ├── gatk.conf          # Miner-tunable GATK quality parameters
 │   ├── deepvariant.conf   # Miner-tunable DeepVariant parameters

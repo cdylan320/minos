@@ -66,22 +66,50 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-# 3. Reference data
-REF_CHECK=""
-if [ -f datasets/reference/chr20/chr20.fa ]; then
-    REF_CHECK="new"
-elif [ -f datasets/reference/chr20.fa ]; then
-    REF_CHECK="legacy"
-fi
-
-if [ -z "$REF_CHECK" ]; then
-    echo -e "${RED}Reference data not found.${NC}"
-    echo "  Run: bash install.sh"
-    exit 1
-fi
-
 # Activate venv
 source "$VENV/bin/activate"
+
+ensure_runtime_assets() {
+    local ref_ok=false
+    local missing=0
+    local images=(
+        "genonet/hap-py@sha256:03acabe84bbfba35f5a7234129d524c563f5657e1f21150a2ea2797f8e6d05f2"
+        "broadinstitute/gatk:4.5.0.0"
+        "google/deepvariant:1.5.0"
+        "staphb/freebayes:1.3.7"
+        "quay.io/biocontainers/bcftools:1.20--h8b25389_0"
+        "quay.io/biocontainers/samtools:1.20--h50ea8bc_0"
+    )
+    local image
+
+    if [ -f datasets/reference/chr20/chr20.fa ] || [ -f datasets/reference/chr20.fa ]; then
+        ref_ok=true
+    fi
+
+    for image in "${images[@]}"; do
+        if ! docker image inspect "$image" >/dev/null 2>&1; then
+            missing=$((missing + 1))
+        fi
+    done
+
+    if [ "$ref_ok" = true ] && [ "$missing" -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}Required Minos validator assets are missing; downloading them automatically.${NC}"
+    if [ "$ref_ok" != true ]; then
+        echo "  - reference data"
+    fi
+    if [ "$missing" -gt 0 ]; then
+        echo "  - ${missing} Docker image(s)"
+    fi
+
+    if ! python setup.py --update-data-only; then
+        echo -e "${RED}Could not download required validator assets.${NC}"
+        echo "  Retry: python setup.py --update-data-only"
+        exit 1
+    fi
+}
 
 # --- Load existing .env defaults (if any) ---
 
@@ -216,6 +244,8 @@ EOF
     # Reload
     set -a; source .env; set +a
 fi
+
+ensure_runtime_assets
 
 echo -e "${GREEN}Starting Minos Validator...${NC}"
 python -m neurons.validator \

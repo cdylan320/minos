@@ -51,7 +51,7 @@ def test_finalize_round_with_no_valid_scores_does_not_reuse_previous_round(monke
 
     tracker.update("hk_previous", 0.91)
     tracker.record_round("round_previous", ["hk_previous"])
-    assert tracker.ema_scores == {"hk_previous": 0.91}
+    assert tracker.round_scores == {"hk_previous": 0.91}
 
     set_weights_called = False
 
@@ -78,7 +78,7 @@ def test_finalize_round_with_no_valid_scores_does_not_reuse_previous_round(monke
 
     assert result is False
     assert not set_weights_called
-    assert tracker.ema_scores == {}
+    assert tracker.round_scores == {}
     assert tracker.last_raw_scores == {}
 
     sys.modules.pop("neurons.validator", None)

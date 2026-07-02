@@ -36,6 +36,7 @@ venv.bak/
 
 # Environment variables
 .env
+.minos_ai_assistant_prompted
 
 # Logs
 *.log

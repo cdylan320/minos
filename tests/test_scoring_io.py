@@ -19,6 +19,7 @@ from utils.scoring import (
     parse_region_overcall_metrics,
     parse_happy_vcf_assessed_metrics,
     HappyScorer,
+    slice_truth_vcf,
     subset_bed,
 )
 
@@ -247,6 +248,37 @@ class TestSubsetBed:
         regions = _read_bed(target)
         assert len(regions) == 1
         assert regions[0] == ("chr20", 9999000, 10000500)
+
+
+# ---------------------------------------------------------------------------
+# TestSliceTruthVcf
+# ---------------------------------------------------------------------------
+
+class TestSliceTruthVcf:
+    def test_reindexes_source_vcf_before_slicing(self, tmp_path):
+        source = tmp_path / "truth.vcf.gz"
+        target = tmp_path / "truth_chr20.vcf.gz"
+        source.write_bytes(b"placeholder")
+        Path(str(source) + ".tbi").write_bytes(b"placeholder")
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd[0] == "docker" and "view" in cmd:
+                target.write_bytes(b"placeholder")
+            result = MagicMock()
+            result.returncode = 0
+            result.stdout = ""
+            result.stderr = ""
+            return result
+
+        with patch("utils.scoring.subprocess.run", side_effect=fake_run):
+            assert slice_truth_vcf(source, target, "chr20:10000000-10010000")
+
+        assert calls[0] == ["tabix", "-p", "vcf", "-f", str(source.resolve())]
+        assert any(cmd[0] == "docker" and "view" in cmd for cmd in calls)
+        assert any(cmd[0] == "docker" and "index" in cmd for cmd in calls)
 
 
 # ---------------------------------------------------------------------------

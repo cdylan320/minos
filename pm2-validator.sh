@@ -10,8 +10,9 @@ if [[ ! -f "$CONFIG" ]]; then
 fi
 
 if ! command -v pm2 &>/dev/null; then
-  echo "PM2 not found. Install with: npm install -g pm2" >&2
-  echo "Or re-run: bash install.sh (installs PM2 when npm is available)" >&2
+  echo "PM2 not found. Re-run: bash install.sh" >&2
+  echo "The installer repairs Node/npm, installs PM2, and reports any PATH fix needed." >&2
+  echo "Manual fallback: npm install -g pm2" >&2
   exit 1
 fi
 
